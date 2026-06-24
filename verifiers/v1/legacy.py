@@ -162,6 +162,7 @@ def _to_v1_tokens(raw: Any) -> TurnTokens | None:
         prompt_ids=list(raw.get("prompt_ids") or []),
         completion_ids=list(raw.get("completion_ids") or []),
         completion_logprobs=list(raw.get("completion_logprobs") or []),
+        routed_experts=raw.get("routed_experts"),
     )
 
 
