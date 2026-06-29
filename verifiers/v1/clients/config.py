@@ -34,6 +34,10 @@ class BaseClientConfig(BaseConfig):
     api_key_var: str = "PRIME_API_KEY"
     headers: dict[str, str] = Field(default_factory=dict)
     """Extra HTTP headers sent on every request."""
+    extra_headers_from_state: dict[str, str] = Field(default_factory=dict)
+    """Maps HTTP header names to rollout-state field names; the value is read from the
+    rollout state on each request (e.g. {"X-Session-ID": "trajectory_id"} for sticky
+    per-rollout routing at the inference router). Must traverse to the env server."""
 
     @model_validator(mode="after")
     def apply_prime_config(self) -> "BaseClientConfig":

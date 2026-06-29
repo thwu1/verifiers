@@ -350,6 +350,7 @@ class LegacyEnvServer(EnvServer):
                     api_base_url=client_config.base_url,
                     api_key_var=client_config.api_key_var,
                     extra_headers=dict(client_config.headers or {}),
+                    extra_headers_from_state=dict(client_config.extra_headers_from_state or {}),
                 )
             else:
                 v0_config = V0ClientConfig(
@@ -357,6 +358,7 @@ class LegacyEnvServer(EnvServer):
                     api_base_url=client_config.base_url,
                     api_key_var=client_config.api_key_var,
                     extra_headers=dict(client_config.headers or {}),
+                    extra_headers_from_state=dict(client_config.extra_headers_from_state or {}),
                 )
             self._clients[key] = resolve_client(v0_config)
         return self._clients[key]
