@@ -13,8 +13,8 @@ from typing import (
     Literal,
     TypeAlias,
     TypeVar,
-    overload,
     cast,
+    overload,
 )
 
 from anthropic import Anthropic, AsyncAnthropic
@@ -934,7 +934,7 @@ class ClientConfig(BaseModel):
     api_base_url: str = "https://api.pinference.ai/api/v1"
     endpoint_configs: list["EndpointClientConfig"] = Field(default_factory=list)
     timeout: float = 3600.0
-    connect_timeout: float = 5.0
+    connect_timeout: float = 30.0
     max_connections: int = 28000
     max_keepalive_connections: int = 28000
     max_retries: int = 10
@@ -1001,7 +1001,7 @@ class EndpointClientConfig(BaseModel):
     api_key_var: str = "PRIME_API_KEY"
     api_base_url: str = "https://api.pinference.ai/api/v1"
     timeout: float = 3600.0
-    connect_timeout: float = 5.0
+    connect_timeout: float = 30.0
     max_connections: int = 28000
     max_keepalive_connections: int = 28000
     max_retries: int = 10

@@ -21,6 +21,7 @@ from typing import Any
 import zmq
 import zmq.asyncio
 
+from verifiers.v1 import graph
 from verifiers.v1.clients.config import ClientConfig, TrainClientConfig
 from verifiers.v1.serve.server import EnvServer
 from verifiers.v1.serve.types import (
@@ -30,7 +31,6 @@ from verifiers.v1.serve.types import (
     RunRolloutResponse,
 )
 from verifiers.v1.task import WireTask
-from verifiers.v1 import graph
 from verifiers.v1.trace import Error, TimeSpan, Timing, Trace
 from verifiers.v1.types import (
     AssistantMessage,
@@ -198,6 +198,17 @@ _V0_TO_V1_TRUNCATION_STOP = {
 }
 
 
+def _v0_transport_kwargs(client_config: ClientConfig) -> dict[str, Any]:
+    timeout = client_config.timeout
+    return {
+        "timeout": timeout if timeout is not None else 3600.0,
+        "connect_timeout": client_config.connect_timeout,
+        "max_connections": client_config.max_connections,
+        "max_keepalive_connections": client_config.max_keepalive_connections,
+        "max_retries": client_config.max_retries,
+    }
+
+
 def _v1_stop_condition(out: dict) -> str | None:
     """The v1 stop condition for a v0 rollout. When v0 flagged the rollout truncated, return a
     name in v1's truncation vocabulary so ``Trace.is_truncated`` derives ``True`` — mapping the
@@ -351,6 +362,7 @@ class LegacyEnvServer(EnvServer):
                     api_key_var=client_config.api_key_var,
                     extra_headers=dict(client_config.headers or {}),
                     extra_headers_from_state=dict(client_config.extra_headers_from_state or {}),
+                    **_v0_transport_kwargs(client_config),
                 )
             else:
                 v0_config = V0ClientConfig(
@@ -359,6 +371,7 @@ class LegacyEnvServer(EnvServer):
                     api_key_var=client_config.api_key_var,
                     extra_headers=dict(client_config.headers or {}),
                     extra_headers_from_state=dict(client_config.extra_headers_from_state or {}),
+                    **_v0_transport_kwargs(client_config),
                 )
             self._clients[key] = resolve_client(v0_config)
         return self._clients[key]
@@ -417,6 +430,7 @@ def _eval_client(client_config: ClientConfig, model: str):
             api_base_url=client_config.base_url,
             api_key_var=client_config.api_key_var,
             extra_headers=dict(getattr(client_config, "headers", None) or {}),
+            **_v0_transport_kwargs(client_config),
         )
     )
 
@@ -446,7 +460,6 @@ async def run_legacy_eval(config) -> list[Trace]:
     import random
 
     from verifiers import load_environment
-
     from verifiers.v1.cli.output import append_trace, save_config
     from verifiers.v1.utils.install import ensure_installed
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from abc import abstractmethod
@@ -25,6 +26,32 @@ from verifiers.utils.response_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _response_total_tokens(response: Response) -> int | None:
+    usage = response.usage
+    if usage is None:
+        return None
+    total_tokens = getattr(usage, "total_tokens", None)
+    if isinstance(total_tokens, int):
+        return total_tokens
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+        return prompt_tokens + completion_tokens
+    return None
+
+
+def _has_malformed_tool_call_arguments(response: Response) -> bool:
+    for tool_call in response.message.tool_calls or []:
+        arguments = getattr(tool_call, "arguments", None)
+        if not isinstance(arguments, str):
+            continue
+        try:
+            json.loads(arguments)
+        except json.JSONDecodeError:
+            return True
+    return False
 
 
 class MultiTurnMonitorRubric(vf.Rubric):
@@ -142,6 +169,17 @@ class MultiTurnEnv(vf.Environment):
         prompt_messages: Messages,
         response: Response,
     ):
+        if (
+            self.max_seq_len is not None
+            and response.message.finish_reason == "tool_calls"
+            and _has_malformed_tool_call_arguments(response)
+            and (total_tokens := _response_total_tokens(response)) is not None
+            and total_tokens >= self.max_seq_len
+        ):
+            raise vf.OverlongPromptError(
+                f"model response exhausted context window ({total_tokens}/{self.max_seq_len} tokens) "
+                "with an incomplete tool call"
+            )
         completion_messages = await parse_response_message(response)
         tokens = await parse_response_tokens(response, self.max_seq_len)
         response_is_truncated = response.message.is_truncated or False
