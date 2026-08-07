@@ -23,7 +23,13 @@ from .decorators import (  # noqa # isort: skip
     teardown,
     update,
 )
-from .types import DatasetBuilder, EndpointConfig, Endpoints, State  # noqa # isort: skip
+from .types import (  # noqa # isort: skip
+    DatasetBuilder,
+    EndpointConfig,
+    Endpoints,
+    GROUP_ROLLOUT_SLOT_INFO_KEY,
+    State,
+)
 from .parsers.parser import Parser  # noqa # isort: skip
 from .rubrics.rubric import Rubric  # noqa # isort: skip
 
@@ -52,6 +58,7 @@ setup_logging(os.getenv("VF_LOG_LEVEL"))
 
 __all__ = [
     "DatasetBuilder",
+    "GROUP_ROLLOUT_SLOT_INFO_KEY",
     "State",
     "Parser",
     "ThinkParser",

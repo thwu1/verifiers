@@ -12,8 +12,8 @@ new wire format (incl. non-OpenAI providers like Anthropic) is just a new `Diale
 change. Endpoint config (base url, api key, billing headers) comes from the client config.
 """
 
-from collections.abc import Mapping
 import re
+from collections.abc import Mapping
 
 import httpx
 from pydantic_core import from_json, to_json
@@ -64,20 +64,28 @@ class EvalClient(Client):
     """Relay native JSON to the provider and parse a copy for the trace."""
 
     def __init__(
-        self, base_url: str, api_key: str, headers: dict[str, str] | None = None
+        self,
+        base_url: str,
+        api_key: str,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+        connect_timeout: float = 30.0,
+        max_connections: int = 28000,
+        max_keepalive_connections: int = 28000,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         # Keep endpoint headers separate so they can override intercepted request headers before
         # the dialect's provider authentication is applied.
         self.headers = dict(headers or {})
-        # No timeout: agentic completions are slow and the rollout timeout is the real backstop.
         # Build full URLs ourselves (base_url + dialect.upstream_path) rather than relying on
         # httpx base-url joining, which drops the base path for a leading-slash request path.
-        # Match V1's default concurrency while retaining HTTPX's 20-idle keepalive bound.
         self.http = httpx.AsyncClient(
-            timeout=None,
-            limits=httpx.Limits(max_connections=128, max_keepalive_connections=20),
+            timeout=httpx.Timeout(timeout, connect=connect_timeout),
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+            ),
         )
 
     async def get_response(

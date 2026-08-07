@@ -6,7 +6,9 @@ dump without importing the originating taskset."""
 import json
 
 import verifiers.v1 as vf
+from verifiers.types import GROUP_ROLLOUT_SLOT_INFO_KEY
 from verifiers.v1.graph import MessageNode
+from verifiers.v1.legacy import rollout_output_to_trace
 from verifiers.v1.types import AssistantMessage, UserMessage
 
 
@@ -16,6 +18,22 @@ class MyTask(vf.Task):
 
 class MyState(vf.State):
     score: int = 0
+
+
+def test_v0_trace_preserves_group_slot_info():
+    trace = rollout_output_to_trace(
+        {
+            "prompt": [],
+            "answer": "",
+            "reward": 0.0,
+            "metrics": {},
+            "info": {GROUP_ROLLOUT_SLOT_INFO_KEY: 3},
+            "trajectory": [],
+        },
+        task_idx=0,
+    )
+
+    assert trace.info[GROUP_ROLLOUT_SLOT_INFO_KEY] == 3
 
 
 def test_bare_trace_round_trip():

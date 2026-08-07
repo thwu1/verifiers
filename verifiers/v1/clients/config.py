@@ -12,6 +12,7 @@ import os
 from typing import Annotated, Literal
 from urllib.parse import urlparse
 
+import httpx
 from openai import AsyncOpenAI
 from pydantic import Field, model_validator
 from pydantic_config import BaseConfig
@@ -34,6 +35,21 @@ class BaseClientConfig(BaseConfig):
     api_key_var: str = "PRIME_API_KEY"
     headers: dict[str, str] = Field(default_factory=dict)
     """Extra HTTP headers sent on every request."""
+    extra_headers_from_state: dict[str, str] = Field(default_factory=dict)
+    """Maps HTTP header names to rollout-state field names; the value is read from the
+    rollout state on each request (e.g. {"X-Session-ID": "trajectory_id"} for sticky
+    per-rollout routing at the inference router). Must traverse to the env server."""
+    timeout: float | None = Field(None, gt=0)
+    """Model request timeout in seconds. ``None`` leaves long generations bounded by rollout
+    timeouts instead of the HTTP client."""
+    connect_timeout: float = Field(30.0, gt=0)
+    """Timeout for opening a connection to the model endpoint."""
+    max_connections: int = Field(28000, ge=1)
+    """Maximum concurrent HTTP connections to the model endpoint."""
+    max_keepalive_connections: int = Field(28000, ge=0)
+    """Maximum idle keepalive HTTP connections to the model endpoint."""
+    max_retries: int = Field(10, ge=0)
+    """Maximum transient model-provider retries in clients that own retry policy."""
 
     @model_validator(mode="after")
     def apply_prime_config(self) -> "BaseClientConfig":
@@ -88,6 +104,16 @@ ClientConfig = Annotated[
 ]
 
 
+def _http_client(config: BaseClientConfig) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(config.timeout, connect=config.connect_timeout),
+        limits=httpx.Limits(
+            max_connections=config.max_connections,
+            max_keepalive_connections=config.max_keepalive_connections,
+        ),
+    )
+
+
 def resolve_client(config: BaseClientConfig) -> Client:
     api_key = os.environ.get(config.api_key_var)
     host = urlparse(config.base_url).hostname or ""
@@ -104,6 +130,8 @@ def resolve_client(config: BaseClientConfig) -> Client:
             base_url=config.base_url,
             api_key=api_key,
             default_headers=config.headers or None,
+            max_retries=config.max_retries,
+            http_client=_http_client(config),
         )
         return TrainClient(
             openai,
@@ -112,4 +140,12 @@ def resolve_client(config: BaseClientConfig) -> Client:
             renderer_model_name=config.renderer_model_name,
         )
     # The proxy is a raw httpx forwarder; the dialect supplies the auth scheme + upstream path.
-    return EvalClient(config.base_url, api_key, headers=config.headers or None)
+    return EvalClient(
+        config.base_url,
+        api_key,
+        headers=config.headers or None,
+        timeout=config.timeout,
+        connect_timeout=config.connect_timeout,
+        max_connections=config.max_connections,
+        max_keepalive_connections=config.max_keepalive_connections,
+    )

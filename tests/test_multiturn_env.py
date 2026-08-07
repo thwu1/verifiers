@@ -3,9 +3,58 @@
 import asyncio
 
 import pytest
+import verifiers as vf
 from datasets import Dataset
-
 from verifiers import Messages, MultiTurnEnv, Parser, Rubric, State, stop
+from verifiers.types import Response, ResponseMessage, ToolCall, Usage
+
+
+class NoopMultiTurnEnv(MultiTurnEnv):
+    async def env_response(self, messages, state, **kwargs):  # type: ignore[override]
+        return []
+
+
+def make_tool_call_response(
+    *,
+    arguments: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    finish_reason: str = "tool_calls",
+) -> Response:
+    return Response(
+        id="test-id",
+        created=0,
+        model="test-model",
+        usage=Usage(
+            prompt_tokens=prompt_tokens,
+            reasoning_tokens=0,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+        message=ResponseMessage(
+            content=None,
+            reasoning_content=None,
+            finish_reason=finish_reason,
+            is_truncated=False,
+            tokens=None,
+            tool_calls=[
+                ToolCall(
+                    id="call-1",
+                    name="bash",
+                    arguments=arguments,
+                )
+            ],
+        ),
+    )
+
+
+def make_response_env(*, max_seq_len: int) -> NoopMultiTurnEnv:
+    return NoopMultiTurnEnv(
+        dataset=Dataset.from_dict({"prompt": [[{"role": "user", "content": "hi"}]]}),
+        parser=Parser(),
+        rubric=Rubric(),
+        max_seq_len=max_seq_len,
+    )
 
 
 class TestMultiTurnEnv:
@@ -704,3 +753,38 @@ class TestMultiTurnEnv:
         assert completion[0]["content"] == "First response"
         assert completion[1]["role"] == "user"
         assert completion[1]["content"] == "Final feedback"
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_call_at_context_window_raises_overlong_prompt():
+    env = make_response_env(max_seq_len=102144)
+    response = make_tool_call_response(
+        arguments='{"command": "python3 <',
+        prompt_tokens=101501,
+        completion_tokens=643,
+    )
+
+    with pytest.raises(vf.OverlongPromptError):
+        await env.add_model_response(
+            State({"trajectory_id": "test-trajectory", "trajectory": []}),
+            [{"role": "user", "content": "hi"}],
+            response,
+        )
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_call_below_context_window_is_recorded():
+    env = make_response_env(max_seq_len=102144)
+    state = State({"trajectory_id": "test-trajectory", "trajectory": []})
+    response = make_tool_call_response(
+        arguments='{"command": "python3 <',
+        prompt_tokens=100000,
+        completion_tokens=643,
+    )
+
+    await env.add_model_response(state, [{"role": "user", "content": "hi"}], response)
+
+    assert len(state["trajectory"]) == 1
+    assert state["trajectory"][0]["completion"][0]["tool_calls"][0].arguments == (
+        '{"command": "python3 <'
+    )
