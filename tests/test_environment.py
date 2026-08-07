@@ -1,15 +1,16 @@
 """Tests for the base Environment class."""
 
+import asyncio
 import json
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from datasets import Dataset
-
 import verifiers as vf
+from datasets import Dataset
 from verifiers import Environment, Parser, Rubric, ThinkParser
 from verifiers.types import (
+    GROUP_ROLLOUT_SLOT_INFO_KEY,
     GenerateOutputs,
     Messages,
     Response,
@@ -122,6 +123,76 @@ class TestEnvironmentBase:
         assert not group_env.provides_advantages
         assert grouped_rubric_env.requires_group_rollouts
         assert not grouped_rubric_env.provides_advantages
+
+    @pytest.mark.asyncio
+    async def test_group_scoring_stamps_slots_in_input_order(
+        self, mock_client, sample_dataset
+    ):
+        env = SimpleEnvironment(
+            dataset=sample_dataset,
+            parser=Parser(),
+            rubric=Rubric(),
+        )
+        observed_slots = []
+
+        async def delayed_rollout(input, client, model, sampling_args):
+            del client, model, sampling_args
+            await asyncio.sleep(0.001 * (3 - input["example_id"]))
+            state = await env.init_state(input, mock_client, "test-model")
+            state["is_completed"] = True
+            return state
+
+        async def score_group(states):
+            observed_slots.extend(
+                state["info"][GROUP_ROLLOUT_SLOT_INFO_KEY] for state in states
+            )
+            for state in states:
+                state["reward"] = 0.0
+                state["metrics"] = {}
+
+        env.rollout = delayed_rollout  # type: ignore[method-assign]
+        env.rubric.score_group = score_group  # type: ignore[method-assign]
+        inputs = [
+            {
+                "prompt": [{"role": "user", "content": str(index)}],
+                "example_id": index,
+                "info": {},
+            }
+            for index in range(4)
+        ]
+
+        states = await env._run_group_states(inputs, mock_client, "test-model", {})
+
+        assert observed_slots == [0, 1, 2, 3]
+        assert [state["info"][GROUP_ROLLOUT_SLOT_INFO_KEY] for state in states] == [
+            0,
+            1,
+            2,
+            3,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_group_scoring_rejects_conflicting_reserved_slot(
+        self, mock_client, sample_dataset
+    ):
+        env = SimpleEnvironment(
+            dataset=sample_dataset, parser=Parser(), rubric=Rubric()
+        )
+
+        async def rollout(input, client, model, sampling_args):
+            return await env.init_state(input, client, model, sampling_args)
+
+        env.rollout = rollout  # type: ignore[method-assign]
+        inputs = [
+            {
+                "prompt": [{"role": "user", "content": "question"}],
+                "example_id": 0,
+                "info": {GROUP_ROLLOUT_SLOT_INFO_KEY: True},
+            }
+        ]
+
+        with pytest.raises(ValueError, match="conflicts with group position"):
+            await env._run_group_states(inputs, mock_client, "test-model", {})
 
     def test_environment_with_eval_dataset_only(self, sample_dataset):
         """Test Environment with only eval_dataset."""

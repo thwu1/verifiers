@@ -244,6 +244,7 @@ def rollout_output_to_trace(out: dict, task_idx: int) -> Trace:
         task=_to_wire_task(task_idx, out.get("prompt"), out.get("answer")),
         rewards={"reward": float(out.get("reward") or 0.0)},
         metrics={k: float(v) for k, v in (out.get("metrics") or {}).items()},
+        info=dict(out.get("info") or {}),
         is_completed=bool(out.get("is_completed", True)),
         stop_condition=_v1_stop_condition(out),
         errors=[error] if error else [],

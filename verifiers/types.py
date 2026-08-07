@@ -243,6 +243,7 @@ class Response(CustomBaseModel):
 
 # Core data types
 Info = dict[str, Any]
+GROUP_ROLLOUT_SLOT_INFO_KEY = "_vf_group_rollout_slot"
 SamplingArgs = dict[str, Any]
 IndividualRewardFunc = Callable[..., float | Awaitable[float]]
 GroupRewardFunc = Callable[..., list[float] | Awaitable[list[float]]]
