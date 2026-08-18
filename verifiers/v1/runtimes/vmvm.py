@@ -54,10 +54,10 @@ class VMVMConfig(BaseConfig):
     sshd_ready_timeout: float = Field(180.0, gt=0)
     max_session_buffer_size: int | None = Field(16 * 1024 * 1024, gt=0)
     """Maximum captured command output. None uses the backend default."""
-    # VMVM leases have provider-selected resources. Accept task resource declarations so
-    # tasksets compose without warnings, but do not claim that the lease enforces them.
-    cpu: float | None = None
-    memory: float | None = None
+    # The VM tier remains provider-selected. CPU and memory declarations are applied as
+    # Podman cgroup limits; they cannot increase the leased VM's physical capacity.
+    cpu: float | None = Field(None, gt=0)
+    memory: float | None = Field(None, gt=0)
     gpu: str | None = None
     disk: float | None = None
 
@@ -84,6 +84,8 @@ def create_backend(config: VMVMConfig) -> VMVMBackend:
         tunnel_ready_timeout=config.tunnel_ready_timeout,
         sshd_ready_timeout=config.sshd_ready_timeout,
         max_session_buffer_size=config.max_session_buffer_size,
+        cpu=config.cpu,
+        memory_gb=config.memory,
     )
     return VacliVMVMBackend(backend_config)
 
