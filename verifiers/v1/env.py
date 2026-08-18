@@ -18,12 +18,12 @@ from typing import Annotated, Literal
 from pydantic import Field, SerializeAsAny, model_validator
 from pydantic_config import BaseConfig
 
-from verifiers.v1.harness import HarnessConfig
 from verifiers.v1.clients import RolloutContext
 from verifiers.v1.decorators import discover_decorated
 from verifiers.v1.episode import Episode
-from verifiers.v1.types import EnvId
+from verifiers.v1.harness import HarnessConfig
 from verifiers.v1.interception import InterceptionPool, RolloutLimits
+from verifiers.v1.mcp import serve_shared
 from verifiers.v1.retries import RetryConfig
 from verifiers.v1.rollout import Rollout
 from verifiers.v1.runtimes import (
@@ -33,7 +33,7 @@ from verifiers.v1.runtimes import (
 )
 from verifiers.v1.task import Task
 from verifiers.v1.taskset import TasksetConfig
-from verifiers.v1.mcp import serve_shared
+from verifiers.v1.types import EnvId
 
 
 class TimeoutConfig(BaseConfig):
@@ -71,9 +71,7 @@ class ElasticPoolConfig(BaseConfig):
 
 
 # Discriminated on `type` so the CLI selects with `--pool.type static|elastic`.
-PoolConfig = Annotated[
-    StaticPoolConfig | ElasticPoolConfig, Field(discriminator="type")
-]
+PoolConfig = Annotated[StaticPoolConfig | ElasticPoolConfig, Field(discriminator="type")]
 
 
 def pool_serve_kwargs(pool: StaticPoolConfig | ElasticPoolConfig) -> dict:
@@ -159,16 +157,10 @@ class EnvConfig(BaseConfig):
 
         narrow_plugin_field(data, "taskset", taskset_config_type)
         taskset = data.get("taskset")
-        taskset_id = (
-            taskset.get("id")
-            if isinstance(taskset, dict)
-            else getattr(taskset, "id", None)
-        )
+        taskset_id = taskset.get("id") if isinstance(taskset, dict) else getattr(taskset, "id", None)
         # A taskset that bundles its own harness runs with it by default; an explicit
         # `--harness.id` / toml id (already on the field) takes precedence.
-        narrow_plugin_field(
-            data, "harness", harness_config_type, default_harness_id(taskset_id or "")
-        )
+        narrow_plugin_field(data, "harness", harness_config_type, default_harness_id(taskset_id or ""))
         return data
 
 
@@ -199,15 +191,11 @@ def resolve_runtime_config(
         if isinstance(config, SubprocessConfig):
             raise ValueError(
                 f"task {task.idx!r} requires image {task.image!r}, but the subprocess "
-                "runtime has no container; use the docker or prime runtime"
+                "runtime has no container; use docker, prime, modal, or vmvm"
             )
         updates["image"] = task.image
     workdir_spec = type(config).model_fields.get("workdir")
-    if (
-        task.workdir is not None
-        and workdir_spec is not None
-        and getattr(config, "workdir") == workdir_spec.default
-    ):
+    if task.workdir is not None and workdir_spec is not None and getattr(config, "workdir") == workdir_spec.default:
         updates["workdir"] = task.workdir
     for field, value in task.resources.model_dump(exclude_none=True).items():
         spec = type(config).model_fields.get(field)
@@ -220,9 +208,7 @@ def resolve_runtime_config(
                     config.type,
                     field,
                 )
-        elif (
-            getattr(config, field) == spec.default
-        ):  # still the default → task may set it
+        elif getattr(config, field) == spec.default:  # still the default → task may set it
             updates[field] = value
         # else: cli/toml changed it from the default → it wins over the task
     return config.model_copy(update=updates) if updates else config
@@ -236,39 +222,29 @@ class Environment:
         self.config = config
         self.taskset = load_taskset(config.taskset)
         self.harness = load_harness(config.harness)
-        if (
-            not self.harness.SUPPORTS_MCP
-            and type(self.taskset).tools is not Taskset.tools
-        ):
+        if not self.harness.SUPPORTS_MCP and type(self.taskset).tools is not Taskset.tools:
             raise ValueError(
                 f"Harness {self.harness.config.id!r} does not support MCP tools, but taskset "
                 f"{self.taskset.config.id!r} exposes tool servers (MCP). Run it with a harness "
                 f"that supports MCP (e.g. --harness.id default), or use a taskset without tools."
             )
-        if (
-            not self.harness.SUPPORTS_USER_SIM
-            and type(self.taskset).user is not Taskset.user
-        ):
+        if not self.harness.SUPPORTS_USER_SIM and type(self.taskset).user is not Taskset.user:
             raise ValueError(
                 f"Harness {self.harness.config.id!r} does not drive a user simulator, but taskset "
                 f"{self.taskset.config.id!r} defines one (Taskset.user). Run it with a harness that "
                 f"supports user simulation (e.g. --harness.id default), or use a taskset without one."
             )
-        if self.taskset.NEEDS_CONTAINER and isinstance(
-            self.harness.config.runtime, SubprocessConfig
-        ):
+        if self.taskset.NEEDS_CONTAINER and isinstance(self.harness.config.runtime, SubprocessConfig):
             raise ValueError(
                 f"Taskset {self.taskset.config.id!r} needs a container runtime "
                 "(NEEDS_CONTAINER), but the harness runs on the subprocess runtime; "
-                "use --harness.runtime.type docker or prime."
+                "use --harness.runtime.type docker, prime, modal, or vmvm."
             )
-        if self.harness.config.id != "default" and isinstance(
-            self.harness.config.runtime, SubprocessConfig
-        ):
+        if self.harness.config.id != "default" and isinstance(self.harness.config.runtime, SubprocessConfig):
             logger.warning(
                 "Harness %r is running in the subprocess runtime on the local system. "
                 "Local files and settings may affect the evaluation; use subprocess only "
-                "for debugging. Use --harness.runtime.type docker or prime for an isolated "
+                "for debugging. Use --harness.runtime.type docker, prime, modal, or vmvm for an isolated "
                 "run.",
                 self.harness.config.id,
             )
@@ -292,9 +268,7 @@ class Environment:
     def runtime_for(self, task: Task) -> RuntimeConfig:
         """Resolve the runtime config for a task off the harness's runtime (see
         `resolve_runtime_config`)."""
-        return resolve_runtime_config(
-            self.harness.config.runtime, task, self._warned_resources
-        )
+        return resolve_runtime_config(self.harness.config.runtime, task, self._warned_resources)
 
     def episode(self, task: Task, ctx: RolloutContext, n: int = 1) -> Episode:
         """Resolve `task` into a runnable episode of `n` rollouts: pick its runtime
@@ -310,19 +284,9 @@ class Environment:
                 f"need >=2; got n={n} (pass -r/--num-rollouts >= 2)"
             )
         runtime_config = self.runtime_for(task)
-        setup_timeout = (
-            self.setup_timeout if self.setup_timeout is not None else task.timeout.setup
-        )
-        harness_timeout = (
-            self.harness_timeout
-            if self.harness_timeout is not None
-            else task.timeout.harness
-        )
-        if (
-            harness_timeout is not None
-            and harness_timeout > 24 * 60 * 60
-            and not runtime_is_local(runtime_config)
-        ):
+        setup_timeout = self.setup_timeout if self.setup_timeout is not None else task.timeout.setup
+        harness_timeout = self.harness_timeout if self.harness_timeout is not None else task.timeout.harness
+        if harness_timeout is not None and harness_timeout > 24 * 60 * 60 and not runtime_is_local(runtime_config):
             logger.warning(
                 "task %r resolves to a %.1f-hour harness timeout, but %s sandboxes have a "
                 "maximum lifetime of 24 hours; capping it at 24 hours",
@@ -331,16 +295,8 @@ class Environment:
                 runtime_config.type,
             )
             harness_timeout = 24 * 60 * 60
-        finalize_timeout = (
-            self.finalize_timeout
-            if self.finalize_timeout is not None
-            else task.timeout.finalize
-        )
-        scoring_timeout = (
-            self.scoring_timeout
-            if self.scoring_timeout is not None
-            else task.timeout.scoring
-        )
+        finalize_timeout = self.finalize_timeout if self.finalize_timeout is not None else task.timeout.finalize
+        scoring_timeout = self.scoring_timeout if self.scoring_timeout is not None else task.timeout.scoring
         retries = self.config.retries
         rollouts = [
             Rollout(

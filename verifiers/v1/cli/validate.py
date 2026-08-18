@@ -22,7 +22,6 @@ from pydantic_config import cli
 
 import verifiers.v1 as vf
 from verifiers.v1.cli.dashboard import TaskProgress, validate_dashboard
-from verifiers.v1.utils.logging import setup_logging
 from verifiers.v1.cli.resolve import (
     extract_id,
     references_config_file,
@@ -32,6 +31,7 @@ from verifiers.v1.configs.validate import ValidateConfig
 from verifiers.v1.env import resolve_runtime_config
 from verifiers.v1.runtimes import make_runtime
 from verifiers.v1.taskset import Taskset
+from verifiers.v1.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -73,19 +73,13 @@ async def _validate_task(taskset: Taskset, task, config: ValidateConfig) -> dict
     stage timeout), tear the runtime down, and return the result row. A raised error is
     captured onto the row (one bad task is data, not a crash) — never re-raised."""
     start = time.time()
-    runtime = make_runtime(
-        resolve_runtime_config(config.runtime, task), name=f"validate-{task.idx}"
-    )
-    setup_timeout = (
-        config.setup_timeout if config.setup_timeout is not None else task.timeout.setup
-    )
+    runtime = make_runtime(resolve_runtime_config(config.runtime, task), name=f"validate-{task.idx}")
+    setup_timeout = config.setup_timeout if config.setup_timeout is not None else task.timeout.setup
     valid, exc = False, None
     try:
         await runtime.start()
         await asyncio.wait_for(taskset.setup(task, runtime), setup_timeout)
-        valid = await asyncio.wait_for(
-            taskset.validate(task, runtime), config.validate_timeout
-        )
+        valid = await asyncio.wait_for(taskset.validate(task, runtime), config.validate_timeout)
     except Exception as e:
         exc = e
     finally:
@@ -113,11 +107,9 @@ async def run_validate(config: ValidateConfig) -> list[dict]:
         random.Random(0).shuffle(tasks)
     if config.num_tasks is not None:
         tasks = tasks[: config.num_tasks]
-    if isinstance(config.runtime, vf.SubprocessConfig) and (
-        taskset.NEEDS_CONTAINER or any(t.image for t in tasks)
-    ):
+    if isinstance(config.runtime, vf.SubprocessConfig) and (taskset.NEEDS_CONTAINER or any(t.image for t in tasks)):
         raise SystemExit(
-            "taskset needs a container runtime to validate - pass --runtime.type docker (or prime)"
+            "taskset needs a container runtime to validate - pass --runtime.type docker, prime, modal, or vmvm"
         )
     logger.info(
         "validating %d task(s) from %s on the %s runtime",
@@ -149,11 +141,7 @@ async def run_validate(config: ValidateConfig) -> list[dict]:
             )
         return row
 
-    display = (
-        validate_dashboard(states, config, time.time())
-        if config.rich
-        else contextlib.nullcontext()
-    )
+    display = validate_dashboard(states, config, time.time()) if config.rich else contextlib.nullcontext()
     async with display:
         return await asyncio.gather(*(_one(t) for t in tasks))
 
@@ -167,9 +155,7 @@ def main(argv: list[str] | None = None) -> None:
         cli(_narrow(argv))  # full option help, narrowed to the given taskset
         return
     if not extract_id(argv, "taskset") and not references_config_file(argv):
-        raise SystemExit(
-            USAGE
-        )  # need a taskset (positional / --taskset.id) or a @ file.toml
+        raise SystemExit(USAGE)  # need a taskset (positional / --taskset.id) or a @ file.toml
 
     config_type = _narrow(argv)
     sys.argv = [sys.argv[0], *argv]  # let prime-pydantic-config render help/errors

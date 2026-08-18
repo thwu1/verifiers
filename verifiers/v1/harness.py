@@ -18,7 +18,6 @@ from pydantic_config import BaseConfig
 from verifiers.v1.clients import RolloutContext
 from verifiers.v1.decorators import discover_decorated, invoke
 from verifiers.v1.errors import HarnessError, boundary
-from verifiers.v1.utils.install import env_name
 from verifiers.v1.runtimes import (
     ProgramResult,
     Runtime,
@@ -28,6 +27,7 @@ from verifiers.v1.runtimes import (
 from verifiers.v1.task import Task
 from verifiers.v1.trace import Trace
 from verifiers.v1.types import EnvId, Messages
+from verifiers.v1.utils.install import env_name
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +43,9 @@ class HarnessConfig(BaseConfig):
     `org/name[@version]` package installed on demand from the Environments Hub (see
     `EnvId`). Set via `--harness.id`."""
     runtime: RuntimeConfig = SubprocessConfig()
-    """Where the harness runs (subprocess / docker / prime). Subprocess by default — a local
+    """Where the harness runs (subprocess / docker / prime / modal / vmvm). Subprocess by default — a local
     process on the host; a taskset that needs a container (its own image, or NEEDS_CONTAINER)
-    selects `--harness.runtime.type docker` (or prime/modal). Lives on the harness — it's the
+    selects `--harness.runtime.type docker` (or another container runtime). Lives on the harness — it's the
     harness's box; tool servers have their own placement (see `TasksetConfig.tools`)."""
     env: dict[str, str] = Field(default_factory=dict)
     """Additional environment variables for the harness program. Harness-owned endpoint,
@@ -87,14 +87,9 @@ class Harness(ABC, Generic[ConfigT]):
         the user simulator opens the conversation (see `Taskset.user`); the harness emits no
         opening user message."""
         prompt = task.prompt
-        if (
-            prompt is not None
-            and not isinstance(prompt, str)
-            and not self.SUPPORTS_MESSAGE_PROMPT
-        ):
+        if prompt is not None and not isinstance(prompt, str) and not self.SUPPORTS_MESSAGE_PROMPT:
             raise ValueError(
-                f"Harness {self.config.id!r} does not support a Messages prompt; "
-                "task.prompt must be a string or None."
+                f"Harness {self.config.id!r} does not support a Messages prompt; task.prompt must be a string or None."
             )
         system = task.system_prompt
         if system is None or self.APPENDS_SYSTEM_PROMPT:
@@ -106,8 +101,7 @@ class Harness(ABC, Generic[ConfigT]):
                 "APPENDS_SYSTEM_PROMPT to emit it as a system message."
             )
         logger.warning(
-            "Harness %r does not support a separate system prompt; prepending "
-            "task.system_prompt to the user prompt.",
+            "Harness %r does not support a separate system prompt; prepending task.system_prompt to the user prompt.",
             self.config.id,
         )
         return None, f"{system}\n\n{prompt}"
@@ -134,9 +128,7 @@ class Harness(ABC, Generic[ConfigT]):
         if result.exit_code != 0:
             # The real cause is at the END of a traceback, so keep the tail.
             detail = (result.stderr or result.stdout).strip()[-2000:] or "<no output>"
-            raise HarnessError(
-                f"harness {self.config.id!r} exited {result.exit_code}: {detail}"
-            )
+            raise HarnessError(f"harness {self.config.id!r} exited {result.exit_code}: {detail}")
         trace.stop("agent_completed")
 
     async def score(self, trace: Trace, runtime: Runtime) -> None:

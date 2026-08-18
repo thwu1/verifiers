@@ -16,7 +16,7 @@ config. You'll likely work with them in different proportions:
   `codex`); you only write your own if you need a custom rollout loop. With some exceptions, any
   taskset runs under any harness.
 - **Runtime** — *where* the harness (and the taskset's tools / user simulator) executes:
-  `subprocess` / `docker` / `prime` / `modal`. **You never write one** — runtimes ship with the
+  `subprocess` / `docker` / `prime` / `modal` / `vmvm`. **You never write one** — runtimes ship with the
   framework behind one `Runtime` contract and compose with any taskset/harness; you just choose
   where code runs.
 
@@ -298,7 +298,7 @@ isolated environment. On a `runtime` you can call:
 
 A non-zero `exit_code` is a normal result, not an exception — check it and `raise` (a plain
 Python error) yourself if it should fail the stage; the framework records a failure in your
-taskset code as a `TasksetError`. The same code works on subprocess / docker / prime / modal.
+taskset code as a `TasksetError`. The same code works on subprocess / docker / prime / modal / vmvm.
 
 A SWE taskset is the canonical case: `setup` provisions the repo, the agent edits it during the
 rollout, and a `@reward` runs the tests in the *same* runtime:
@@ -505,6 +505,15 @@ Otherwise pick a built-in, selected with `--harness.id`:
 | `mini-swe-agent` | the mini-swe-agent CLI (a minimal SWE agent) |
 | `kimi-code` | the Kimi Code CLI agent |
 
+`mini-swe-agent` defaults to its `mini` config. For benchmark-specific prompts and
+limits, select a built-in config with `--harness.config-file swebench.yaml`; append
+upstream config specs with repeated `--harness.config-overrides`, which take
+precedence over the harness defaults. The harness resolves the config from the
+selected mini-swe-agent version and merges everything into one temporary YAML, so
+the same interface also works with 1.x releases whose CLI accepts only one `-c`.
+Runs are unattended: the CLI keeps yolo execution but uses the non-interactive
+agent's terminal behavior instead of prompting when a step limit is reached.
+
 ```bash
 uv run eval gsm8k-v1 -n 1                    # default harness
 uv run eval gsm8k-v1 -n 1 --harness.id rlm   # same taskset, different driver
@@ -617,10 +626,21 @@ uv run eval gsm8k-v1 -n 1 --harness.runtime.type subprocess  # local process (ev
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type docker      # local container
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type prime       # remote prime sandbox (requires auth)
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type modal       # remote modal sandbox (requires auth)
+uv run eval gsm8k-v1 -n 1 --harness.runtime.type sandoq      # remote Sandoq sandbox
+uv run eval gsm8k-v1 -n 1 --harness.runtime.type vmvm        # remote vacli VMVM
 ```
 
 A taskset that sets `NEEDS_CONTAINER` (or a task with an `image`) refuses the subprocess runtime —
-pass `docker` / `prime` / `modal`.
+pass `docker` / `prime` / `modal` / `sandoq` / `vmvm`. VMVM requires `vacli` plus the local
+`vmvm_tb_v2` package on `PYTHONPATH`; programs inside the VM reach the host interception
+server through a vacli SSH reverse forward. VMVM does not use Prime sandboxes or
+require Prime tunnel credentials.
+
+Sandoq uses the pinned provider package on `PYTHONPATH`. Its default
+`host_tunnel = "modal"` completes the host-interception direction with a
+temporary Modal reverse relay and does not require Prime credentials. Use
+`mode = "oci-runner"` for task-specific images; that mode requires the external
+OCI runner token configured by the deployment.
 
 ---
 
