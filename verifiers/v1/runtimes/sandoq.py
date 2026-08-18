@@ -24,6 +24,7 @@ from verifiers.v1.runtimes.limiters import creation_limiter
 from verifiers.v1.runtimes.modal_tunnel import modal_host_endpoint
 
 logger = logging.getLogger(__name__)
+_OCI_BOOTSTRAP_WORKDIR = "/tmp"
 
 
 class SandoqConfig(BaseConfig):
@@ -108,7 +109,7 @@ class SandoqRuntime(Runtime):
             gpu_type=gpu_type,
             network_access=self.config.network_access,
             timeout_minutes=24 * 60,
-            environment_vars={"OCI_EXPECTED_WORKDIR": self.config.workdir}
+            environment_vars={"OCI_EXPECTED_WORKDIR": _OCI_BOOTSTRAP_WORKDIR}
             if self.config.mode == "oci-runner"
             else None,
         )
@@ -122,7 +123,7 @@ class SandoqRuntime(Runtime):
                 client,
                 ["mkdir", "-p", self.config.workdir],
                 {},
-                working_dir="/",
+                working_dir=_OCI_BOOTSTRAP_WORKDIR if self.config.mode == "oci-runner" else "/",
             )
             if result.exit_code != 0:
                 raise RuntimeError(result.stderr or result.stdout)

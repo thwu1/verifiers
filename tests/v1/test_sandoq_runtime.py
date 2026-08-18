@@ -96,13 +96,13 @@ async def test_sandoq_runtime_lifecycle(monkeypatch) -> None:
     await runtime.start()
     assert runtime.descriptor == "assignment-123"
     assert client.request.docker_image == "swebench/image"
-    assert client.request.environment_vars == {"OCI_EXPECTED_WORKDIR": "/testbed"}
+    assert client.request.environment_vars == {"OCI_EXPECTED_WORKDIR": "/tmp"}
 
     result = await runtime.run(["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"})
     assert result.exit_code == 0
     assert result.stdout == "ok"
     assert client.commands[:2] == [
-        ("mkdir -p /testbed", "/", {}, 123),
+        ("mkdir -p /testbed", "/tmp", {}, 123),
         ("sh -c 'printf ok'", "/testbed", {"MESSAGE": "value with spaces"}, 123),
     ]
 
