@@ -18,7 +18,6 @@ import time
 from contextlib import asynccontextmanager
 from enum import StrEnum
 
-from verifiers.v1.harness import Harness
 from verifiers.v1.clients import RolloutContext
 from verifiers.v1.decorators import discover_decorated
 from verifiers.v1.errors import (
@@ -28,12 +27,14 @@ from verifiers.v1.errors import (
     ToolsetError,
     boundary,
 )
+from verifiers.v1.harness import Harness
 from verifiers.v1.interception import (
     InterceptionPool,
     InterceptionServer,
     RolloutLimits,
     RolloutSession,
 )
+from verifiers.v1.mcp import serve_tools, serve_user
 from verifiers.v1.runtimes import (
     HOST,
     Runtime,
@@ -41,7 +42,6 @@ from verifiers.v1.runtimes import (
     make_runtime,
     reachable_url,
 )
-from verifiers.v1.mcp import serve_tools, serve_user
 from verifiers.v1.state import state_cls
 from verifiers.v1.task import Task
 from verifiers.v1.taskset import Taskset
@@ -117,7 +117,7 @@ class Rollout:
         tool server tunnels to it itself); `state_base` its reachable URL (localhost, or the pool's
         tunnel) — how a SHARED tool server reaches this rollout's `/state` + `/task` channel."""
         if pool is not None:
-            async with pool.acquire(session) as (
+            async with pool.acquire(session, runtime) as (
                 endpoint,
                 secret,
                 state_port,
@@ -157,9 +157,7 @@ class Rollout:
             session = RolloutSession(ctx, trace, stops, self.limits)
             await runtime.start()
             setup_deadline = (
-                None
-                if self.setup_timeout is None
-                else asyncio.get_running_loop().time() + self.setup_timeout
+                None if self.setup_timeout is None else asyncio.get_running_loop().time() + self.setup_timeout
             )
             async with (
                 boundary(TasksetError, "taskset setup"),
@@ -171,9 +169,7 @@ class Rollout:
                 asyncio.timeout_at(setup_deadline),
             ):
                 await self.harness.setup(runtime)
-            async with self._serve_interception(
-                self.interception, runtime, session
-            ) as (
+            async with self._serve_interception(self.interception, runtime, session) as (
                 endpoint,
                 secret,
                 state_port,
@@ -218,9 +214,7 @@ class Rollout:
                     # (like max_turns), even if its last call had failed.
                     try:
                         await asyncio.wait_for(
-                            self.harness.run(
-                                ctx, trace, runtime, endpoint, secret, urls
-                            ),
+                            self.harness.run(ctx, trace, runtime, endpoint, secret, urls),
                             self.harness_timeout,
                         )
                     except TimeoutError:
@@ -243,9 +237,7 @@ class Rollout:
                 )
             now = time.time()
             trace.timing.finalize.end = now
-            self.phase = (
-                Phase.SCORING
-            )  # per-rollout scoring; the Episode marks DONE after group scoring
+            self.phase = Phase.SCORING  # per-rollout scoring; the Episode marks DONE after group scoring
             trace.timing.scoring.start = now
             async with boundary(TasksetError, "scoring"):
                 # Per-rollout scoring: taskset + harness, concurrently, both with the live
@@ -282,9 +274,7 @@ class Rollout:
             try:
                 await runtime.stop()
             except Exception:
-                logger.warning(
-                    "runtime teardown failed (rollout %s)", trace.id, exc_info=True
-                )
+                logger.warning("runtime teardown failed (rollout %s)", trace.id, exc_info=True)
         logger.info(
             "rollout done: id=%s task=%s reward=%.3f turns=%d stop=%s",
             trace.id,

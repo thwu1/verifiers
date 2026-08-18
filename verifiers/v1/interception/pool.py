@@ -1,14 +1,12 @@
 """A pool of shared interception servers, grown on demand, so N concurrent rollouts need
 ~N/multiplex servers + tunnels rather than one each.
 
-Behind a remote runtime each rollout's interception endpoint needs a tunnel, and tunnel
-creation is rate-capped per API token — so one-tunnel-per-rollout caps how wide a remote
-eval (or env server) can fan out. Each shared `InterceptionServer` serves up to `multiplex`
-rollouts behind one tunnel (created via a host-side exposer runtime of the harness's runtime
-type). The pool is elastic: `acquire` reuses a server with a free slot, else brings up a new
-one — so it fits both the bounded eval runner and the env server's unbounded request load.
-The harness is unchanged: it authenticates with a per-rollout secret, which is what the
-server routes by.
+Behind most remote runtimes each rollout's interception endpoint needs a rate-capped public
+tunnel. Each shared `InterceptionServer` serves up to `multiplex` rollouts behind one such
+tunnel. A runtime with instance-scoped host reachability, such as VMVM or Sandoq, still shares servers
+but opens an SSH route from each provisioned instance. The pool is elastic: `acquire` reuses
+a server with a free slot, else brings up a new one. The harness authenticates with a
+per-rollout secret, which is what the server routes by.
 """
 
 import asyncio
@@ -17,7 +15,14 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 
 from verifiers.v1.interception.server import InterceptionServer, RolloutSession
-from verifiers.v1.runtimes import HOST, RuntimeConfig, reachable_url, runtime_is_local
+from verifiers.v1.runtimes import (
+    HOST,
+    Runtime,
+    RuntimeConfig,
+    reachable_url,
+    runtime_has_instance_host_endpoint,
+    runtime_is_local,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +30,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PooledServer:
     server: InterceptionServer
-    base_url: str  # reachable interception base: `{base_url}/v1` (model), `/state` + `/task` (servers)
+    # The shared reachable base for provider-independent tunnels. An instance-scoped runtime
+    # (VMVM) opens its own route to this server while it holds a pool slot.
+    base_url: str | None
     load: int = 0
 
 
@@ -40,6 +47,7 @@ class InterceptionPool:
         # class (no provisioning) — the pool never runs a sandbox.
         self.runtime_type = runtime_config.type
         self.is_local = runtime_is_local(runtime_config)
+        self.instance_host_endpoint = runtime_has_instance_host_endpoint(runtime_config)
         self.multiplex = max(1, multiplex)
         self._servers: list[PooledServer] = []
         self._lock = asyncio.Lock()
@@ -63,9 +71,11 @@ class InterceptionPool:
         await self._stack.enter_async_context(server)
         # The interception server is a HOST service the harness reaches: localhost for a local
         # harness runtime, a tunnel for a remote one. Owned by the pool's stack, torn down with it.
-        url = await self._stack.enter_async_context(
-            reachable_url(HOST, server.port, consumer_is_local=self.is_local)
-        )
+        url = None
+        if not self.instance_host_endpoint:
+            url = await self._stack.enter_async_context(
+                reachable_url(HOST, server.port, consumer_is_local=self.is_local)
+            )
         entry = PooledServer(server, url)
         self._servers.append(entry)
         logger.info(
@@ -77,7 +87,7 @@ class InterceptionPool:
         return entry
 
     @asynccontextmanager
-    async def acquire(self, session: RolloutSession):
+    async def acquire(self, session: RolloutSession, runtime: Runtime):
         """Register `session` on a server with spare capacity (bringing one up if needed) and yield
         its `(endpoint, secret, port, base_url)` — `endpoint` is the model route (`{base_url}/v1`),
         `port` the interception server's host port (a per-rollout tool server's own channel), and
@@ -88,7 +98,11 @@ class InterceptionPool:
             secret = entry.server.register(session)
             entry.load += 1
         try:
-            yield f"{entry.base_url}/v1", secret, entry.server.port, entry.base_url
+            if entry.base_url is not None:
+                yield f"{entry.base_url}/v1", secret, entry.server.port, entry.base_url
+            else:
+                async with runtime.host_endpoint(entry.server.port) as base_url:
+                    yield f"{base_url}/v1", secret, entry.server.port, base_url
         finally:
             entry.server.unregister(secret)
             entry.load -= 1

@@ -19,8 +19,8 @@ from verifiers.v1.decorators import group_reward, metric, reward, stop, tool
 from verifiers.v1.env import (
     ElasticPoolConfig,
     EnvConfig,
-    EnvServerConfig,
     Environment,
+    EnvServerConfig,
     StaticPoolConfig,
     TimeoutConfig,
     pool_serve_kwargs,
@@ -37,6 +37,7 @@ from verifiers.v1.errors import (
     TunnelError,
     UserError,
 )
+from verifiers.v1.graph import MessageNode
 from verifiers.v1.harness import Harness, HarnessConfig
 from verifiers.v1.loaders import (
     default_harness_id,
@@ -48,6 +49,12 @@ from verifiers.v1.loaders import (
     task_type,
     taskset_config_type,
 )
+from verifiers.v1.mcp import (
+    Toolset,
+    ToolsetConfig,
+    User,
+    UserConfig,
+)
 from verifiers.v1.retries import RetryConfig, RolloutRetryConfig
 from verifiers.v1.rollout import Rollout
 from verifiers.v1.runtimes import (
@@ -56,18 +63,13 @@ from verifiers.v1.runtimes import (
     ProgramResult,
     Runtime,
     RuntimeConfig,
+    SandoqConfig,
     SubprocessConfig,
+    VMVMConfig,
 )
 from verifiers.v1.state import State, StateT
 from verifiers.v1.task import Task, TaskResources, TaskTimeout, WireTask
 from verifiers.v1.taskset import Taskset, TasksetConfig
-from verifiers.v1.mcp import (
-    Toolset,
-    ToolsetConfig,
-    User,
-    UserConfig,
-)
-from verifiers.v1.graph import MessageNode
 from verifiers.v1.trace import (
     Branch,
     Error,
@@ -93,8 +95,8 @@ from verifiers.v1.types import (
     TextContentPart,
     Tool,
     ToolCall,
-    TurnTokens,
     ToolMessage,
+    TurnTokens,
     Usage,
     UserMessage,
 )
@@ -169,6 +171,8 @@ __all__ = [
     "SubprocessConfig",
     "DockerConfig",
     "PrimeConfig",
+    "SandoqConfig",
+    "VMVMConfig",
     "Environment",
     "EnvConfig",
     "EnvServerConfig",

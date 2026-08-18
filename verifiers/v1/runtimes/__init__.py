@@ -2,7 +2,7 @@
 
 Each runtime decides WHERE the program runs and HOW it reaches the host
 interception server: subprocess (local), docker (local container), or prime /
-modal (remote sandbox). They share the `Runtime` contract, so the Environment is
+modal / Sandoq / VMVM (remote sandbox). They share the `Runtime` contract, so the Environment is
 runtime-agnostic. `RuntimeConfig` is the discriminated config union and
 `make_runtime` builds the runtime matching a config.
 """
@@ -22,10 +22,12 @@ from verifiers.v1.runtimes.base import (
 from verifiers.v1.runtimes.docker import DockerConfig, DockerRuntime
 from verifiers.v1.runtimes.modal import ModalConfig, ModalRuntime
 from verifiers.v1.runtimes.prime import PrimeConfig, PrimeRuntime
+from verifiers.v1.runtimes.sandoq import SandoqConfig, SandoqRuntime
 from verifiers.v1.runtimes.subprocess import SubprocessConfig, SubprocessRuntime
+from verifiers.v1.runtimes.vmvm import VMVMConfig, VMVMRuntime
 
 RuntimeConfig = Annotated[
-    SubprocessConfig | DockerConfig | PrimeConfig | ModalConfig,
+    SubprocessConfig | DockerConfig | PrimeConfig | ModalConfig | SandoqConfig | VMVMConfig,
     Field(discriminator="type"),
 ]
 
@@ -37,6 +39,10 @@ def _runtime_cls(config: RuntimeConfig) -> type[Runtime]:
         return ModalRuntime
     if isinstance(config, DockerConfig):
         return DockerRuntime
+    if isinstance(config, SandoqConfig):
+        return SandoqRuntime
+    if isinstance(config, VMVMConfig):
+        return VMVMRuntime
     return SubprocessRuntime
 
 
@@ -54,12 +60,18 @@ def runtime_is_local(config: RuntimeConfig) -> bool:
     return _runtime_cls(config).is_local
 
 
+def runtime_has_instance_host_endpoint(config: RuntimeConfig) -> bool:
+    """Whether host reachability depends on an already-started runtime instance."""
+    return _runtime_cls(config).instance_host_endpoint
+
+
 __all__ = [
     "ProgramResult",
     "Runtime",
     "RuntimeConfig",
     "make_runtime",
     "runtime_is_local",
+    "runtime_has_instance_host_endpoint",
     "host_endpoint",
     "reachable_url",
     "HOST",
@@ -71,4 +83,8 @@ __all__ = [
     "PrimeRuntime",
     "ModalConfig",
     "ModalRuntime",
+    "SandoqConfig",
+    "SandoqRuntime",
+    "VMVMConfig",
+    "VMVMRuntime",
 ]

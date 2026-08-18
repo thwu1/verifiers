@@ -145,10 +145,11 @@ thousands of servers or tunnels.
 A `Runtime` (`runtimes/base.py`) is the single contract for *where* code runs:
 `start`/`stop`/`cleanup`, `run(argv, env)` and `run_background(...)`, `run_uv_script(...)`,
 `read`/`write`, and `expose(port)` (the URL by which the host reaches a port inside the
-runtime — localhost for subprocess, a tunnel for prime/modal). The same contract backs the
+runtime — localhost for subprocess, a tunnel for prime/modal/sandoq/vmvm). The same contract backs the
 harness, a task's tool servers, and the user simulator, so any of them runs in any backend:
 `subprocess` (local, `/tmp/<name>` workspace, own process group), `docker` (local container),
-`prime` (remote sandbox), `modal` (remote function).
+`prime` (remote sandbox), `modal` (remote function), `sandoq` (remote session),
+`vmvm` (remote vacli VM).
 
 Resources are named after the rollout id (greppable) and their teardown is guaranteed: a live
 runtime registers in a `WeakSet`, and an `atexit` hook reaps anything a signal-interrupted

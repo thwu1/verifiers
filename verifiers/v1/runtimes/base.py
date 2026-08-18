@@ -107,8 +107,17 @@ class Runtime(ABC):
     is_local: ClassVar[bool] = True
     """Whether this runtime shares the host network — a program inside it reaches a host service
     at localhost (no tunnel) and a service inside it is reachable at localhost. True for
-    subprocess / docker(--network host); remote runtimes (modal/prime) override to False (they
+    subprocess / docker(--network host); remote runtimes (modal/prime/sandoq/vmvm) override to False (they
     need a tunnel each way: `host_endpoint` inward, `expose` outward)."""
+
+    instance_host_endpoint: ClassVar[bool] = False
+    """Whether reaching a host port requires this provisioned runtime instance.
+
+    Most remote runtimes use the provider-independent public host tunnel, which can be
+    shared before an individual sandbox exists. VMVM reaches the host over its vacli SSH
+    lease, while Sandoq selects its own tunnel backend; both endpoints are opened after
+    the runtime has started.
+    """
 
     def __init__(self, name: str | None = None) -> None:
         self.name = name or f"vf-{uuid.uuid4().hex[:12]}"
@@ -123,7 +132,7 @@ class Runtime(ABC):
 
     @property
     def type(self) -> str:
-        """The runtime's config discriminator ("subprocess" / "docker" / "prime" / "modal")."""
+        """The runtime's config discriminator (subprocess/docker/prime/modal/sandoq/vmvm)."""
         return self.config.type
 
     @property
@@ -163,15 +172,11 @@ class Runtime(ABC):
         still retry individual safe transport operations underneath `run`."""
         return await self.run(argv, env)
 
-    async def run_background(
-        self, argv: list[str], env: dict[str, str], log: str
-    ) -> None:
+    async def run_background(self, argv: list[str], env: dict[str, str], log: str) -> None:
         """Start `argv` as a background process in the runtime (combined output to
         `log`, a path in the workspace) and return immediately. It runs until `stop()`
         tears the runtime down. Used to host a tool server colocated with the harness."""
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support run_background"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support run_background")
 
     async def prepare_uv_script(
         self,
@@ -197,13 +202,8 @@ class Runtime(ABC):
                     )
                     result = await self.run(["sh", "-c", command], env or {})
                     if result.exit_code != 0:
-                        raise RuntimeError(
-                            "failed to prepare uv script: "
-                            f"{result.stderr.strip()[-2000:]}"
-                        )
-                    self._uv_interpreters[digest] = result.stdout.strip().splitlines()[
-                        -1
-                    ]
+                        raise RuntimeError(f"failed to prepare uv script: {result.stderr.strip()[-2000:]}")
+                    self._uv_interpreters[digest] = result.stdout.strip().splitlines()[-1]
         interpreter = self._uv_interpreters[digest]
         venv = str(PurePosixPath(interpreter).parent.parent)
         command = (
@@ -277,17 +277,20 @@ class Runtime(ABC):
         (which reaches a host port from inside a runtime)."""
         return None
 
+    @contextlib.asynccontextmanager
+    async def host_endpoint(self, port: int):
+        """Yield a URL this runtime can use to reach a service on the host."""
+        async with host_endpoint(port, self.is_local) as url:
+            yield url
+
 
 TunnelT = TypeVar("TunnelT")
 
 
-async def open_tunnel(
-    start: Callable[[], Awaitable[TunnelT]], what: str, *, retries: int = 3
-) -> TunnelT:
-    """Open the host interception-server tunnel via `start`, retrying transient failures and raise
-    `TunnelError` if it still fails. Tunnel creation is network-bound and globally rate-capped
-    (`prime_tunnel` — 512/min shared across runtimes), so a transient failure is common and worth a
-    few retries before failing the rollout. `what` names the tunnel in the error."""
+async def open_tunnel(start: Callable[[], Awaitable[TunnelT]], what: str, *, retries: int = 3) -> TunnelT:
+    """Open a tunnel via `start`, retrying transient failures and raising `TunnelError` if it
+    still fails. Tunnel creation is network-bound and may be provider-rate-capped, so a transient
+    failure is common and worth a few retries. `what` names the tunnel in the error."""
     from verifiers.v1.errors import TunnelError
 
     try:
@@ -316,9 +319,7 @@ async def host_endpoint(port: int, is_local: bool, labels: list[str] | None = No
 
     async def _start() -> tuple[Tunnel, str]:
         tunnel = Tunnel(local_port=port, labels=labels or None)
-        async with (
-            TUNNEL_LIMITER
-        ):  # shared prime_tunnel rate (512/min, runtime-independent)
+        async with TUNNEL_LIMITER:  # shared prime_tunnel rate (512/min, runtime-independent)
             return tunnel, str(await tunnel.start()).rstrip("/")
 
     tunnel, url = await open_tunnel(_start, f"host tunnel (port {port})")
@@ -352,9 +353,7 @@ framework driving a user sim) — see `reachable_url`."""
 
 
 @contextlib.asynccontextmanager
-async def reachable_url(
-    service, port: int, *, consumer=None, consumer_is_local: bool = True
-):
+async def reachable_url(service, port: int, *, consumer=None, consumer_is_local: bool = True):
     """Yield a URL for the service at (`service`, `port`) reachable from its consumer — the single
     place tool / user / interception reachability is decided, over the two primitives `expose`
     (publish *out* of a runtime) and `host_endpoint` (reach *into* the host from a runtime).
@@ -372,10 +371,9 @@ async def reachable_url(
     is_local = consumer.is_local if consumer is not None else consumer_is_local
     if service is consumer:  # colocated in the consumer's runtime (or host -> host)
         yield f"http://127.0.0.1:{port}"
-    elif (
-        service is not HOST and not service.is_local
-    ):  # in a sandbox → it publishes its own port
+    elif service is not HOST and not service.is_local:  # in a sandbox → it publishes its own port
         yield await service.expose(port)
     else:  # on the host network → reach it from wherever the consumer runs
-        async with host_endpoint(port, is_local) as url:
+        endpoint = consumer.host_endpoint(port) if consumer is not None else host_endpoint(port, is_local)
+        async with endpoint as url:
             yield url
