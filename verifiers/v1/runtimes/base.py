@@ -48,6 +48,8 @@ _ENSURE_UV = (
     f"{{ {_INSTALL_CURL}; {_DOWNLOAD_UV}; }} "
     "|| pip install -q -U uv 2>/dev/null"
 )
+_UV_PREPARE_RETRIES = 2
+_UV_PREPARE_ERROR_OUTPUT_LIMIT = 2000
 
 # The single port a self-publishing runtime (modal/prime) forwards to a public URL for a server
 # hosted in its sandbox. A server placed in such a runtime binds this (on 0.0.0.0) and is reached
@@ -60,6 +62,25 @@ class ProgramResult:
     exit_code: int
     stdout: str
     stderr: str
+
+
+def _program_failure_detail(
+    result: ProgramResult, limit: int = _UV_PREPARE_ERROR_OUTPUT_LIMIT
+) -> str:
+    """Bounded stdout + stderr for runtimes that expose either or both streams."""
+    streams: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, output in (("stdout", result.stdout), ("stderr", result.stderr)):
+        output = output.strip()
+        if output and output not in seen:
+            streams.append((name, output))
+            seen.add(output)
+    if not streams:
+        return "<no output>"
+
+    framing = sum(len(name) + 2 for name, _ in streams) + len(streams) - 1
+    per_stream = max(1, (limit - framing) // len(streams))
+    return "\n".join(f"{name}: {output[-per_stream:]}" for name, output in streams)
 
 
 def parse_gpu(gpu: str | None) -> tuple[str | None, int]:
@@ -200,10 +221,28 @@ class Runtime(ABC):
                         f"{_ENSURE_UV}; uv sync --script {shlex.quote(path)} -q "
                         f"&& uv python find --script {shlex.quote(path)}"
                     )
-                    result = await self.run(["sh", "-c", command], env or {})
-                    if result.exit_code != 0:
-                        raise RuntimeError(f"failed to prepare uv script: {result.stderr.strip()[-2000:]}")
-                    self._uv_interpreters[digest] = result.stdout.strip().splitlines()[-1]
+                    interpreter = None
+                    async for attempt in retrying(
+                        retries=_UV_PREPARE_RETRIES,
+                        label="uv script preparation",
+                    ):
+                        with attempt:
+                            result = await self.run(["sh", "-c", command], env or {})
+                            if result.exit_code != 0:
+                                raise RuntimeError(
+                                    "failed to prepare uv script "
+                                    f"(exit_code={result.exit_code}): "
+                                    f"{_program_failure_detail(result)}"
+                                )
+                            output_lines = result.stdout.strip().splitlines()
+                            if not output_lines:
+                                raise RuntimeError(
+                                    "failed to prepare uv script (exit_code=0): "
+                                    "uv python find returned no interpreter path"
+                                )
+                            interpreter = output_lines[-1]
+                    assert interpreter is not None
+                    self._uv_interpreters[digest] = interpreter
         interpreter = self._uv_interpreters[digest]
         venv = str(PurePosixPath(interpreter).parent.parent)
         command = (
