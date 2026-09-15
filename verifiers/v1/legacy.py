@@ -492,8 +492,8 @@ async def run_legacy_eval(config) -> list[Trace]:
     sem = asyncio.Semaphore(config.max_concurrent) if config.max_concurrent else None
     write_lock = asyncio.Lock()
 
-    async def run_one(task_idx: int) -> Trace:
-        async def go() -> Trace:
+    async def run_one(task_idx: int) -> Trace | None:
+        async def go() -> Trace | None:
             out = await env.run_rollout(
                 input=dict(dataset[task_idx]),
                 client=client,
@@ -503,7 +503,7 @@ async def run_legacy_eval(config) -> list[Trace]:
             )
             trace = rollout_output_to_trace(out, task_idx)
             await append_trace(out_dir, trace, write_lock)
-            return trace
+            return trace if config.retain_traces else None
 
         if sem is None:
             return await go()
@@ -512,4 +512,4 @@ async def run_legacy_eval(config) -> list[Trace]:
 
     # `num_rollouts` rollouts per selected task, all bounded by the one semaphore.
     coros = [run_one(i) for i in idxs for _ in range(config.num_rollouts)]
-    return list(await asyncio.gather(*coros))
+    return [trace for trace in await asyncio.gather(*coros) if trace is not None]

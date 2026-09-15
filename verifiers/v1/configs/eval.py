@@ -51,6 +51,11 @@ class EvalConfig(EnvServerConfig):
     """Resolve + validate the config and dump it, then exit."""
     rich: bool = True
     """Show a live dashboard instead of per-rollout logs (in-process only)."""
+    retain_traces: bool = True
+    """Keep completed traces in memory and print them when the CLI exits. Disable for large
+    persisted evals: each trace is released after its ``results.jsonl`` append completes and
+    the final per-trace JSON dump is suppressed. Incompatible with the live dashboard, which
+    reads completed traces to render its final state."""
     server: bool = False
     """Drive rollouts through the env-server worker pool (sized by `--pool.*`) instead of
     in-process — the path prime-rl trains through. Incompatible with `--rich`."""
@@ -70,5 +75,10 @@ class EvalConfig(EnvServerConfig):
             raise ValueError(
                 "`--rich` (the live dashboard) runs in-process and can't be combined with "
                 "`--server`; pass `--no-rich` with `--server`."
+            )
+        if self.rich and not self.retain_traces and not self.is_legacy:
+            raise ValueError(
+                "`--rich` retains completed traces for the live dashboard and can't be "
+                "combined with `--no-retain-traces`; pass `--no-rich`."
             )
         return self

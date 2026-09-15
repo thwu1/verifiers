@@ -18,7 +18,8 @@ import sys
 from pydantic_config import cli
 
 import verifiers.v1 as vf
-from verifiers.v1.utils.logging import setup_logging
+from verifiers.v1.cli.eval.resume import load_resume_config, split_resume
+from verifiers.v1.cli.eval.runner import run_eval
 from verifiers.v1.cli.output import output_path, write_config
 from verifiers.v1.cli.resolve import (
     extract_id,
@@ -26,9 +27,8 @@ from verifiers.v1.cli.resolve import (
     references_config_file,
     with_positional_taskset,
 )
-from verifiers.v1.cli.eval.resume import load_resume_config, split_resume
-from verifiers.v1.cli.eval.runner import run_eval
 from verifiers.v1.configs.eval import EvalConfig
+from verifiers.v1.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,7 @@ def main(argv: list[str] | None = None) -> None:
     else:  # in-process (default), with or without the live dashboard
         env = vf.Environment(config)
         traces = asyncio.run(run_eval(env, config))
-    if not rich:  # --rich is the whole output; otherwise dump each trace as JSON
+    if not rich and config.retain_traces:
+        # --rich is the whole output; --no-retain-traces intentionally has no final dump
         for trace in traces:
             print(trace.model_dump_json(indent=2, exclude_none=True))

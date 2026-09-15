@@ -104,13 +104,13 @@ class EnvConfig(BaseConfig):
     capping is a framework concern, never an harness or task field."""
     max_input_tokens: int | None = None
     """Max input (prompt) tokens per rollout (None = no limit). Caps the trace's
-    `prompt_len`; framework-enforced between turns."""
+    `prompt_len`; checked before a response is committed."""
     max_output_tokens: int | None = None
     """Max output (completion) tokens per rollout (None = no limit). Caps the trace's
-    `completion_len`; framework-enforced between turns."""
+    `completion_len`; also clamps each model call's generation budget."""
     max_total_tokens: int | None = None
-    """Max total (prompt + completion) tokens per rollout (None = no limit). Caps the
-    trace's `total_tokens`; framework-enforced between turns."""
+    """Max total prompt + completion tokens in any persisted branch (None = no limit).
+    Also clamps each model call's generation budget."""
     multiplex: int = Field(32, ge=1)
     """Rollouts that share one interception server (and, behind a remote runtime, one
     tunnel). N concurrent rollouts use ~N/multiplex servers + tunnels instead of one each —

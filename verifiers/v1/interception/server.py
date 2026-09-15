@@ -32,10 +32,10 @@ from aiohttp import web
 from pydantic import TypeAdapter, ValidationError
 from pydantic_core import PydanticSerializationError, from_json, to_json
 
+from verifiers.v1 import graph
 from verifiers.v1.clients import RolloutContext
 from verifiers.v1.dialects import DIALECTS, Dialect
 from verifiers.v1.dialects.base import is_sse_done_event
-from verifiers.v1 import graph
 from verifiers.v1.errors import (
     OverlongPromptError,
     RolloutError,
@@ -43,7 +43,7 @@ from verifiers.v1.errors import (
     UserError,
 )
 from verifiers.v1.trace import Trace
-from verifiers.v1.types import Messages
+from verifiers.v1.types import Messages, Response, SamplingConfig
 
 if TYPE_CHECKING:
     from verifiers.v1.mcp import Respond
@@ -87,12 +87,9 @@ async def _queue_chunks(
 
 @dataclass(frozen=True)
 class RolloutLimits:
-    """Per-rollout framework limits (None = no cap), checked before each turn is served.
-    The first limit reached refuses the turn — halting any harness, the same mechanism as
-    a @stop — and becomes the trace's stop condition. Each caps a trace computed property:
-    `max_turns` -> num_turns, `max_input_tokens` -> prompt_len, `max_output_tokens` ->
-    completion_len, `max_total_tokens` -> total_tokens. Token caps are soft by one turn:
-    they're checked between turns, so the turn that crosses a cap still completes."""
+    """Per-rollout framework limits (None = no cap). A reached limit refuses the next turn.
+    Output/total limits additionally clamp each request's generation budget, and the response
+    is checked before commit so no persisted branch can cross a configured token cap."""
 
     max_turns: int | None = None
     max_input_tokens: int | None = None
@@ -116,6 +113,78 @@ class RolloutLimits:
         if (
             self.max_total_tokens is not None
             and trace.total_tokens >= self.max_total_tokens
+        ):
+            return "max_total_tokens"
+        return None
+
+    def constrain_sampling(
+        self,
+        trace: Trace,
+        sampling: SamplingConfig,
+        *,
+        prompt_prefix_tokens: int,
+    ) -> tuple[SamplingConfig, str | None]:
+        """Clamp this call's output allowance to the remaining configured budgets.
+
+        ``prompt_prefix_tokens`` is the exact stored prefix selected for this request. Tokens
+        introduced by new prompt messages are not known until the provider returns token IDs,
+        so :meth:`response_violation` is the final fail-closed guard before graph commit.
+        """
+        if (
+            self.max_input_tokens is not None
+            and prompt_prefix_tokens >= self.max_input_tokens
+        ):
+            return sampling, "max_input_tokens"
+
+        remaining: list[tuple[int, str]] = []
+        if self.max_output_tokens is not None:
+            remaining.append(
+                (
+                    self.max_output_tokens - trace.completion_len,
+                    "max_output_tokens",
+                )
+            )
+        if self.max_total_tokens is not None:
+            remaining.append(
+                (
+                    self.max_total_tokens - prompt_prefix_tokens,
+                    "max_total_tokens",
+                )
+            )
+        if not remaining:
+            return sampling, None
+        budget, limit = min(remaining, key=lambda item: item[0])
+        if budget <= 0:
+            return sampling, limit
+        if sampling.max_tokens is not None and sampling.max_tokens <= budget:
+            return sampling, None
+        return sampling.model_copy(update={"max_tokens": budget}), None
+
+    def response_violation(self, trace: Trace, response: Response) -> str | None:
+        """Return a hard token limit crossed by ``response``, before it is persisted."""
+        tokens = response.tokens
+        if tokens is not None and (tokens.prompt_ids or tokens.completion_ids):
+            prompt_tokens = len(tokens.prompt_ids)
+            completion_tokens = len(tokens.completion_ids)
+        elif response.usage is not None:
+            prompt_tokens = response.usage.input_tokens
+            completion_tokens = response.usage.completion_tokens
+        else:
+            # Without token IDs or provider usage there is no trustworthy unit to compare.
+            return None
+        if (
+            self.max_input_tokens is not None
+            and prompt_tokens > self.max_input_tokens
+        ):
+            return "max_input_tokens"
+        if (
+            self.max_output_tokens is not None
+            and trace.completion_len + completion_tokens > self.max_output_tokens
+        ):
+            return "max_output_tokens"
+        if (
+            self.max_total_tokens is not None
+            and prompt_tokens + completion_tokens > self.max_total_tokens
         ):
             return "max_total_tokens"
         return None
@@ -164,6 +233,30 @@ class RolloutSession:
                 self.trace.stop(stop.__name__)
                 logger.debug("stop %r fired: id=%s", stop.__name__, self.trace.id)
                 return stop.__name__
+        return None
+
+    def sampling_for(
+        self, *, prompt_prefix_tokens: int
+    ) -> tuple[SamplingConfig, str | None]:
+        """Return this turn's bounded sampling config, or stop before an empty-budget call."""
+        sampling, limit = self.limits.constrain_sampling(
+            self.trace,
+            self.ctx.sampling,
+            prompt_prefix_tokens=prompt_prefix_tokens,
+        )
+        if limit is not None:
+            self.trace.stop(limit)
+            logger.debug("limit %r reached: id=%s", limit, self.trace.id)
+        return sampling, limit
+
+    def commit(self, turn: graph.PendingTurn, response: Response) -> str | None:
+        """Commit a response only when its exact/provider-reported sizes fit hard caps."""
+        limit = self.limits.response_violation(self.trace, response)
+        if limit is not None:
+            self.trace.stop(limit)
+            logger.debug("response crossed limit %r: id=%s", limit, self.trace.id)
+            return limit
+        turn.commit(response)
         return None
 
 
@@ -323,13 +416,22 @@ class InterceptionServer:
                     )
                 return _completion_response(completion)
             turn = graph.prepare_turn(session.trace, prompt)
+            sampling, refused = session.sampling_for(
+                prompt_prefix_tokens=turn.path_len
+            )
+            if refused is not None:
+                if completion is None:
+                    return web.json_response(
+                        dialect.error_body(f"rollout stopped: {refused}"), status=400
+                    )
+                return _completion_response(completion)
             session.error = None
             try:
                 response = await session.ctx.client.get_response(
                     dialect,
                     body,
                     session.ctx.model,
-                    session.ctx.sampling,
+                    sampling,
                     headers=headers,
                     session_id=session.trace.id,
                     turn=turn,
@@ -369,14 +471,22 @@ class InterceptionServer:
                 return web.json_response(dialect.error_body(str(e)), status=502)
             # `Response.raw` is the wire response handed to the program 1:1 — the provider's
             # verbatim bytes (proxy) or the client's serialized completion (renderer).
+            if (refused := session.commit(turn, response)) is not None:
+                # The provider returned more than its requested allowance, or a newly added
+                # prompt made the exact branch too large. Do not persist that oversized turn.
+                if completion is None:
+                    return web.json_response(
+                        dialect.error_body(f"rollout stopped: {refused}"), status=400
+                    )
+                return _completion_response(completion)
             completion = response.raw
             logger.debug(
                 "intercept turn: id=%s tools=%d",
                 session.trace.id,
                 len(response.message.tool_calls or []),
             )
-            turn.commit(response)  # one node per new message;
-            # branches fall out of walking the graph (see Trace.branches / verifiers.v1.graph)
+            # session.commit adds one node per new message; branches fall out of walking the
+            # graph (see Trace.branches / verifiers.v1.graph).
             # Hand back to the program when the model wants a tool (the program runs it) or
             # when there's no user simulator to keep the conversation going.
             if response.message.tool_calls or session.user is None:
@@ -429,11 +539,18 @@ class InterceptionServer:
         session.error = None
         try:
             turn = graph.prepare_turn(session.trace, prompt)
+            sampling, refused = session.sampling_for(
+                prompt_prefix_tokens=turn.path_len
+            )
+            if refused is not None:
+                return web.json_response(
+                    dialect.error_body(f"rollout stopped: {refused}"), status=400
+                )
             reply = await session.ctx.client.relay(
                 dialect,
                 body,
                 session.ctx.model,
-                session.ctx.sampling,
+                sampling,
                 headers=request.headers,
                 session_id=session.trace.id,
             )
@@ -508,8 +625,9 @@ class InterceptionServer:
         try:
             if parser_error is not None:
                 raise parser_error
-            turn.commit(parser.finish())
-            logger.debug("intercept stream turn: id=%s", session.trace.id)
+            response = parser.finish()
+            if session.commit(turn, response) is None:
+                logger.debug("intercept stream turn: id=%s", session.trace.id)
         finally:
             with contextlib.suppress(ConnectionResetError):
                 await resp.write_eof()

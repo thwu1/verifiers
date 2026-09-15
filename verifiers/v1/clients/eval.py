@@ -12,6 +12,7 @@ new wire format (incl. non-OpenAI providers like Anthropic) is just a new `Diale
 change. Endpoint config (base url, api key, billing headers) comes from the client config.
 """
 
+import math
 import re
 from collections.abc import Mapping
 
@@ -60,6 +61,36 @@ _BLOCKED_REQUEST_HEADERS = frozenset(
 _SSE_EVENT_END = re.compile(rb"(?>\r\n|\r|\n){2}")
 
 
+def _validate_requested_token_data(
+    response: Response, sampling: SamplingConfig
+) -> None:
+    """Fail before graph commit when explicitly requested training data is unusable."""
+    requested = sampling.model_dump(exclude_none=True)
+    require_ids = requested.get("return_token_ids") is True
+    require_logprobs = requested.get("logprobs") is True
+    if not (require_ids or require_logprobs):
+        return
+
+    tokens = response.tokens
+    if tokens is None:
+        raise model_error(
+            "upstream omitted or returned misaligned token IDs/logprobs requested "
+            "for exact training traces"
+        )
+    if require_ids and (not tokens.prompt_ids or not tokens.completion_ids):
+        raise model_error(
+            "upstream returned empty prompt or completion token IDs requested for "
+            "exact training traces"
+        )
+    if require_logprobs and (
+        len(tokens.completion_logprobs) != len(tokens.completion_ids)
+        or any(not math.isfinite(logprob) for logprob in tokens.completion_logprobs)
+    ):
+        raise model_error(
+            "upstream returned missing, misaligned, or non-finite completion logprobs"
+        )
+
+
 class EvalClient(Client):
     """Relay native JSON to the provider and parse a copy for the trace."""
 
@@ -105,6 +136,7 @@ class EvalClient(Client):
         )
         raw = from_json(resp.content)
         response = dialect.parse_response(dialect.validate_response(raw))
+        _validate_requested_token_data(response, sampling_args)
         response.raw = raw  # the program gets the provider's bytes back 1:1
         return response
 
