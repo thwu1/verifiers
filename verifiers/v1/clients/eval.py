@@ -182,9 +182,9 @@ class EvalClient(Client):
         try:
             response = await self.http.send(request, stream=stream)
         except httpx.TimeoutException as e:
-            raise model_error(str(e), status_code=504) from e
+            raise model_error(f"{type(e).__name__}: {e}", status_code=504) from e
         except httpx.HTTPError as e:
-            raise model_error(str(e), status_code=503) from e
+            raise model_error(f"{type(e).__name__}: {e}", status_code=503) from e
         if not stream:
             try:
                 response.raise_for_status()
