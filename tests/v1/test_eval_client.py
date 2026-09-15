@@ -112,3 +112,15 @@ async def test_requested_exact_tokens_are_accepted_when_aligned(monkeypatch):
     assert response.tokens.prompt_ids == [10, 11]
     assert response.tokens.completion_ids == [20]
     assert response.tokens.completion_logprobs == [-0.1]
+
+
+@pytest.mark.asyncio
+async def test_session_id_sets_generic_and_litellm_affinity_headers():
+    client = EvalClient("http://provider/v1", "key")
+    try:
+        headers = client._headers(ChatDialect(), None, "trajectory-123")
+    finally:
+        await client.close()
+
+    assert headers["X-Session-ID"] == "trajectory-123"
+    assert headers["X-LiteLLM-Session-ID"] == "trajectory-123"

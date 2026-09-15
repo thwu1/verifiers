@@ -13,11 +13,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from openai import AsyncOpenAI, OpenAIError
-from renderers import RenderedTokens
 from renderers import OverlongPromptError as RendererOverlongPromptError
-from renderers import RendererConfig
+from renderers import RenderedTokens, RendererConfig
 
-from verifiers.v1.clients.client import SESSION_ID_HEADER, Client
+from verifiers.v1.clients.client import Client, session_id_headers
 from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect, parse_tools
 from verifiers.v1.dialects.chat import message_to_wire
 from verifiers.v1.errors import OverlongPromptError, model_error
@@ -288,7 +287,7 @@ class TrainClient(Client):
                 prompt_attribution=prompt_attribution,
                 tools=wire_tools,
                 sampling_params=sampling_params,
-                extra_headers={SESSION_ID_HEADER: session_id} if session_id else None,
+                extra_headers=session_id_headers(session_id),
             )
         except RendererOverlongPromptError as e:
             raise OverlongPromptError(str(e)) from e

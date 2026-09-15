@@ -16,11 +16,24 @@ from verifiers.v1.types import Response, Sampling, SamplingConfig
 logger = logging.getLogger(__name__)
 
 SESSION_ID_HEADER = "X-Session-ID"
-"""Per-rollout routing header. Every turn of one rollout sends the same value (the trace id),
-so a session-affinity router (e.g. vLLM's ``consistent_hash`` policy keyed on its
-``request_id_headers``) pins all of a rollout's turns to the same engine — keeping the
-growing cross-turn prefix warm in that engine's KV cache instead of re-prefilling it
-cold on a random shard each turn."""
+LITELLM_SESSION_ID_HEADER = "X-LiteLLM-Session-ID"
+"""Per-rollout routing headers.
+
+Every turn of one rollout sends the same trace id under both the generic session header and
+LiteLLM's deployment-affinity header.  The former supports consistent-hash routers configured
+with ``request_id_headers``; the latter is what LiteLLM's ``session_affinity`` pre-call check
+actually consumes.  Sending both keeps the growing cross-turn prefix on one engine across the
+two router implementations instead of repeatedly discarding its KV cache.
+"""
+
+
+def session_id_headers(session_id: str | None) -> dict[str, str] | None:
+    if session_id is None:
+        return None
+    return {
+        SESSION_ID_HEADER: session_id,
+        LITELLM_SESSION_ID_HEADER: session_id,
+    }
 
 
 @dataclass

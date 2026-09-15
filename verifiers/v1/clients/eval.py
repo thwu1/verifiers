@@ -19,7 +19,7 @@ from collections.abc import Mapping
 import httpx
 from pydantic_core import from_json, to_json
 
-from verifiers.v1.clients.client import SESSION_ID_HEADER, Client, RelayReply
+from verifiers.v1.clients.client import Client, RelayReply, session_id_headers
 from verifiers.v1.dialects import ChatDialect, Dialect
 from verifiers.v1.errors import model_error
 from verifiers.v1.graph import PendingTurn
@@ -160,7 +160,7 @@ class EvalClient(Client):
             headers.pop(name, None)
         headers.update(self.headers)
         if session_id:
-            headers[SESSION_ID_HEADER] = session_id
+            headers.update(session_id_headers(session_id) or {})
         headers.update(dialect.auth_headers(self.api_key))
         return headers
 
