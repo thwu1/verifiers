@@ -211,12 +211,26 @@ class Runtime(ABC):
         if digest not in self._uv_interpreters:
             async with self._uv_script_locks.setdefault(digest, asyncio.Lock()):
                 if digest not in self._uv_interpreters:
+                    directory = str(PurePosixPath(path).parent)
+                    mkdir = await self.run(["mkdir", "-p", directory], {})
+                    if mkdir.exit_code != 0:
+                        raise RuntimeError(
+                            "failed to create uv script directory "
+                            f"(exit_code={mkdir.exit_code}): "
+                            f"{_program_failure_detail(mkdir)}"
+                        )
                     tmp = f"{path}.{uuid.uuid4().hex}.tmp"
                     await self.write(tmp, data)
-                    await self.run(
+                    publish = await self.run(
                         ["sh", "-c", f"mv -f {shlex.quote(tmp)} {shlex.quote(path)}"],
                         {},
                     )
+                    if publish.exit_code != 0:
+                        raise RuntimeError(
+                            "failed to publish uv script "
+                            f"(exit_code={publish.exit_code}): "
+                            f"{_program_failure_detail(publish)}"
+                        )
                     command = (
                         f"{_ENSURE_UV}; uv sync --script {shlex.quote(path)} -q "
                         f"&& uv python find --script {shlex.quote(path)}"
