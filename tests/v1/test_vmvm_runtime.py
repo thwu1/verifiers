@@ -1,5 +1,5 @@
 import pytest
-from verifiers.v1.errors import SandboxError
+from verifiers.v1.errors import SandboxError, TunnelError
 from verifiers.v1.runtimes import (
     VMVMConfig,
     VMVMRuntime,
@@ -141,12 +141,46 @@ async def test_vmvm_runtime_activates_network_before_deferred_startup_and_progra
     isolated_commands = [command for command, _ in backend.commands if "NO_PROXY=*" in command]
     assert len(isolated_commands) == 3
     assert any("socket.create_connection" in command for command in isolated_commands)
+    assert any("curl --noproxy" in command for command in isolated_commands)
+    assert any("wget --no-proxy" in command for command in isolated_commands)
     assert any("start-service" in command for command in isolated_commands)
     assert any("run-agent" in command for command in isolated_commands)
+    assert backend.open_tunnels == []
 
     with pytest.raises(SandboxError, match="cannot relax"):
         await runtime.configure_network_policy("public")
 
+    await runtime.stop()
+
+
+async def test_vmvm_runtime_closes_tunnel_when_post_isolation_http_probe_fails(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+
+    def run_bash(command: str, timeout: float = 60.0) -> vmvm.VMVMBashResult:
+        backend.commands.append((command, timeout))
+        if "socket.create_connection" in command:
+            return {
+                "status": "error",
+                "output": "probe failed",
+                "error_type": "exit",
+                "exit_code": 7,
+            }
+        return backend.result
+
+    backend.run_bash = run_bash
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+    await runtime.configure_network_policy("no-network")
+
+    with pytest.raises(TunnelError, match="unreachable after no-network activation"):
+        async with runtime.host_endpoint(4321):
+            pytest.fail("an unreachable isolated tunnel must not be yielded")
+
+    assert backend.network_activate_calls == 1
+    assert backend.open_tunnels == []
     await runtime.stop()
 
 

@@ -301,6 +301,7 @@ class VMVMRuntime(Runtime):
                     "data=s.recv(16); s.close(); assert data.startswith(b'HTTP/')"
                 )
                 shell_probe = shlex.quote("printf 'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'")
+                probe_url = shlex.quote(f"http://{endpoint.hostname}:{endpoint.port}/")
                 probe = (
                     "if command -v python3 >/dev/null 2>&1; then "
                     f"exec python3 -c {shlex.quote(python_probe)}; "
@@ -311,6 +312,13 @@ class VMVMRuntime(Runtime):
                     "elif command -v busybox >/dev/null 2>&1; then "
                     f"{shell_probe} | busybox nc -w 5 {shlex.quote(endpoint.hostname)} {endpoint.port} | "
                     "head -c 5 | grep -q '^HTTP/'; "
+                    "elif command -v curl >/dev/null 2>&1; then "
+                    f"exec curl --noproxy '*' --silent --show-error --connect-timeout 5 --max-time 5 "
+                    f"--output /dev/null {probe_url}; "
+                    "elif command -v wget >/dev/null 2>&1; then "
+                    f"headers=$(wget --no-proxy --server-response --timeout=5 --tries=1 "
+                    f"--output-document=/dev/null {probe_url} 2>&1 || true); "
+                    "printf '%s\\n' \"$headers\" | grep -q 'HTTP/'; "
                     "else exit 125; fi"
                 )
                 result = await self.run(["sh", "-c", probe], {})
