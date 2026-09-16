@@ -275,7 +275,8 @@ async def test_default_relay_preserves_generic_provider_fields(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_capture_matches_serialized_json_semantics(monkeypatch):
+@pytest.mark.parametrize("non_finite", [math.nan, math.inf, -math.inf])
+async def test_capture_matches_serialized_json_semantics(monkeypatch, non_finite):
     wire_bodies: list[bytes] = []
     client = EvalClient("http://provider/v1", "key", capture_model_io=True)
 
@@ -293,7 +294,7 @@ async def test_capture_matches_serialized_json_semantics(monkeypatch):
             ChatDialect(),
             {
                 "messages": [{"role": "user", "content": "test"}],
-                "provider_extension": {"score": math.nan},
+                "provider_extension": {"score": non_finite},
             },
             "model",
             SamplingConfig(),
@@ -304,6 +305,34 @@ async def test_capture_matches_serialized_json_semantics(monkeypatch):
     assert response.pending_model_io is not None
     assert json.loads(wire_bodies[0]) == response.pending_model_io.request_body
     assert response.pending_model_io.request_body["provider_extension"] == {"score": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("non_finite", [math.nan, math.inf, -math.inf])
+async def test_capture_rejects_non_finite_provider_response(monkeypatch, non_finite):
+    client = EvalClient("http://provider/v1", "key", capture_model_io=True)
+    payload = {**_completion(token_ids=False), "provider_metrics": {"scores": [non_finite]}}
+
+    async def request(url, body, headers, **kwargs):
+        return httpx.Response(
+            200,
+            content=json.dumps(payload).encode(),
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client, "_request", request)
+    try:
+        with pytest.raises(ProviderError, match="upstream response contained a non-finite JSON number") as error:
+            await client.get_response(
+                ChatDialect(),
+                {"messages": [{"role": "user", "content": "test"}]},
+                "model",
+                SamplingConfig(),
+            )
+    finally:
+        await client.close()
+
+    assert error.value.status_code == 502
 
 
 @pytest.mark.asyncio
@@ -360,6 +389,45 @@ async def test_stream_uses_same_final_denylist_and_captures_request(monkeypatch)
     assert streamed.pending_model_io.request_body == sent[0]
     assert streamed.pending_model_io.response_kind == "normalized_stream_response"
     assert streamed.pending_model_io.response_body == streamed.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("non_finite", [math.nan, math.inf, -math.inf])
+async def test_stream_capture_rejects_non_finite_normalized_response(monkeypatch, non_finite):
+    client = EvalClient("http://provider/v1", "key", capture_model_io=True)
+
+    async def request(url, body, headers, **kwargs):
+        return httpx.Response(
+            200,
+            content=b"data: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client, "_request", request)
+    try:
+        reply = await client.relay(
+            ChatDialect(),
+            {"stream": True, "messages": [{"role": "user", "content": "test"}]},
+            "model",
+            SamplingConfig(),
+        )
+        await reply.close()
+    finally:
+        await client.close()
+
+    streamed = vf.Response(
+        id="stream",
+        created=1,
+        model="model",
+        message=vf.AssistantMessage(content="ok"),
+        finish_reason="stop",
+        usage=vf.Usage(prompt_tokens=1, completion_tokens=1, cost=non_finite),
+    )
+    assert reply.finalize_response is not None
+    with pytest.raises(ProviderError, match="normalized streamed response contained a non-finite JSON number"):
+        reply.finalize_response(streamed)
+    assert streamed.pending_model_io is None
 
 
 @pytest.mark.asyncio

@@ -61,6 +61,19 @@ _BLOCKED_REQUEST_HEADERS = frozenset(
 _SSE_EVENT_END = re.compile(rb"(?>\r\n|\r|\n){2}")
 
 
+def validate_capture_json(body: object, source: str) -> None:
+    """Reject non-finite numbers before captured provider JSON reaches trace hashing."""
+    pending = [body]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, float) and not math.isfinite(value):
+            raise model_error(f"{source} contained a non-finite JSON number")
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+
+
 def validate_requested_token_data(response: Response, outbound_body: dict) -> None:
     """Fail before graph commit when explicitly requested training data is unusable."""
     require_ids = outbound_body.get("return_token_ids") is True
@@ -133,6 +146,8 @@ class EvalClient(Client):
             encoded_body=encoded_body,
         )
         raw = from_json(resp.content)
+        if self.capture_model_io:
+            validate_capture_json(raw, "upstream response")
         response = dialect.parse_response(dialect.validate_response(raw))
         validate_requested_token_data(response, outbound_body)
         response.raw = raw  # the program gets the provider's bytes back 1:1
@@ -262,10 +277,12 @@ class EvalClient(Client):
         def finalize_response(response: Response) -> None:
             validate_requested_token_data(response, outbound_body)
             if self.capture_model_io:
+                response_body = response.model_dump(mode="json")
+                validate_capture_json(response_body, "normalized streamed response")
                 response.pending_model_io = PendingModelIO(
                     provider_route=dialect.upstream_path,
                     request_body=from_json(encoded_body),
-                    response_body=response.model_dump(mode="json"),
+                    response_body=response_body,
                     response_kind="normalized_stream_response",
                 )
 
