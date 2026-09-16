@@ -177,30 +177,23 @@ class Branch(StrictBaseModel):
     def total_tokens(self) -> int:
         """This branch's latest sequence length, with provider-usage fallback."""
         exact = sum(len(node.token_ids) for node in self.nodes)
-        last_usage = next(
-            (
-                node.usage
-                for node in reversed(self.nodes)
-                if node.sampled and node.usage is not None
-            ),
-            None,
-        )
-        return max(exact, last_usage.total_tokens if last_usage is not None else 0)
+        last_sampled = next((node for node in reversed(self.nodes) if node.sampled), None)
+        if last_sampled is None or last_sampled.token_ids or last_sampled.mask:
+            return exact
+        usage = last_sampled.usage
+        return max(exact, usage.total_tokens if usage is not None else 0)
 
     @property
     def prompt_len(self) -> int:
         """Latest input context size, with provider-usage fallback."""
-        last_completion = next((sum(n.mask) for n in reversed(self.nodes) if any(n.mask)), 0)
-        exact = sum(len(node.token_ids) for node in self.nodes) - last_completion
-        last_usage = next(
-            (
-                node.usage
-                for node in reversed(self.nodes)
-                if node.sampled and node.usage is not None
-            ),
-            None,
-        )
-        return max(exact, last_usage.input_tokens if last_usage is not None else 0)
+        exact = sum(len(node.token_ids) for node in self.nodes)
+        last_sampled = next((node for node in reversed(self.nodes) if node.sampled), None)
+        if last_sampled is None:
+            return exact
+        if last_sampled.token_ids or last_sampled.mask:
+            return exact - sum(last_sampled.mask)
+        usage = last_sampled.usage
+        return max(exact, usage.input_tokens if usage is not None else 0)
 
     @property
     def usage(self) -> Usage | None:

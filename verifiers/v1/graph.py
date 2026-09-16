@@ -256,18 +256,22 @@ class PendingTurn:
     def accounted_path_len(self) -> int:
         """Best known token length of the reused prefix.
 
-        Exact token arrays are authoritative when present. Eval providers may
-        intentionally omit them, in which case the latest sampled node's
-        provider usage is a lower bound for the next prompt: its prior prompt
-        and completion are both part of the reused conversation.
+        Exact token arrays on the latest sampled turn are authoritative. Eval
+        providers may intentionally omit them; only then is that turn's
+        provider usage used as a conservative fallback. ``max`` preserves any
+        exact prefix already stored by an earlier turn in a mixed trace.
         """
-        usage_total = 0
         for node_id in reversed(self.prefix_node_ids):
-            usage = self.trace.nodes[node_id].usage
-            if usage is not None:
-                usage_total = usage.total_tokens
-                break
-        return max(self.path_len, usage_total)
+            node = self.trace.nodes[node_id]
+            if not node.sampled:
+                continue
+            if node.token_ids or node.mask:
+                return self.path_len
+            return max(
+                self.path_len,
+                node.usage.total_tokens if node.usage is not None else 0,
+            )
+        return self.path_len
 
     @property
     def parent(self) -> int | None:
