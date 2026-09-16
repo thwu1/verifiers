@@ -23,7 +23,7 @@ from verifiers.v1.clients.client import Client, RelayReply, session_id_headers
 from verifiers.v1.dialects import ChatDialect, Dialect
 from verifiers.v1.errors import model_error
 from verifiers.v1.graph import PendingTurn
-from verifiers.v1.types import Response, SamplingConfig
+from verifiers.v1.types import PendingModelIO, Response, SamplingConfig
 
 # These fields describe the localhost request, its original bytes, or its connection. HTTPX
 # rebuilds the provider request from JSON; endpoint configuration and provider auth apply last.
@@ -61,34 +61,25 @@ _BLOCKED_REQUEST_HEADERS = frozenset(
 _SSE_EVENT_END = re.compile(rb"(?>\r\n|\r|\n){2}")
 
 
-def _validate_requested_token_data(
-    response: Response, sampling: SamplingConfig
-) -> None:
+def validate_requested_token_data(response: Response, outbound_body: dict) -> None:
     """Fail before graph commit when explicitly requested training data is unusable."""
-    requested = sampling.model_dump(exclude_none=True)
-    require_ids = requested.get("return_token_ids") is True
-    require_logprobs = requested.get("logprobs") is True
+    require_ids = outbound_body.get("return_token_ids") is True
+    require_logprobs = outbound_body.get("logprobs") is True
     if not (require_ids or require_logprobs):
         return
 
     tokens = response.tokens
     if tokens is None:
         raise model_error(
-            "upstream omitted or returned misaligned token IDs/logprobs requested "
-            "for exact training traces"
+            "upstream omitted or returned misaligned token IDs/logprobs requested for exact training traces"
         )
     if require_ids and (not tokens.prompt_ids or not tokens.completion_ids):
-        raise model_error(
-            "upstream returned empty prompt or completion token IDs requested for "
-            "exact training traces"
-        )
+        raise model_error("upstream returned empty prompt or completion token IDs requested for exact training traces")
     if require_logprobs and (
         len(tokens.completion_logprobs) != len(tokens.completion_ids)
         or any(not math.isfinite(logprob) for logprob in tokens.completion_logprobs)
     ):
-        raise model_error(
-            "upstream returned missing, misaligned, or non-finite completion logprobs"
-        )
+        raise model_error("upstream returned missing, misaligned, or non-finite completion logprobs")
 
 
 class EvalClient(Client):
@@ -99,6 +90,8 @@ class EvalClient(Client):
         base_url: str,
         api_key: str,
         headers: dict[str, str] | None = None,
+        outbound_body_denylist: list[str] | None = None,
+        capture_model_io: bool = False,
         timeout: float | None = None,
         connect_timeout: float = 30.0,
         max_connections: int = 28000,
@@ -109,6 +102,8 @@ class EvalClient(Client):
         # Keep endpoint headers separate so they can override intercepted request headers before
         # the dialect's provider authentication is applied.
         self.headers = dict(headers or {})
+        self.outbound_body_denylist = frozenset(outbound_body_denylist or ())
+        self.capture_model_io = capture_model_io
         # Build full URLs ourselves (base_url + dialect.upstream_path) rather than relying on
         # httpx base-url joining, which drops the base path for a leading-slash request path.
         self.http = httpx.AsyncClient(
@@ -129,16 +124,41 @@ class EvalClient(Client):
         turn: PendingTurn | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> Response:
+        outbound_body = self.outbound_body(dialect, body, model, sampling_args)
+        encoded_body = to_json(outbound_body, inf_nan_mode="null")
         resp = await self._request(
             self.base_url + dialect.upstream_path,
-            dialect.apply_overrides(body, model, sampling_args),
+            outbound_body,
             self._headers(dialect, headers, session_id),
+            encoded_body=encoded_body,
         )
         raw = from_json(resp.content)
         response = dialect.parse_response(dialect.validate_response(raw))
-        _validate_requested_token_data(response, sampling_args)
+        validate_requested_token_data(response, outbound_body)
         response.raw = raw  # the program gets the provider's bytes back 1:1
+        if self.capture_model_io:
+            # Capture the parsed semantics of the exact bytes sent (e.g. non-finite extension
+            # values serialize as JSON null), not the pre-serialization Python object.
+            response.pending_model_io = PendingModelIO(
+                provider_route=dialect.upstream_path,
+                request_body=from_json(encoded_body),
+                response_body=raw,
+                response_kind="exact_provider_json",
+            )
         return response
+
+    def outbound_body(
+        self,
+        dialect: Dialect,
+        body: dict,
+        model: str,
+        sampling_args: SamplingConfig,
+    ) -> dict:
+        """Apply dialect overrides, then the final top-level outbound-field denylist."""
+        overridden = dialect.apply_overrides(body, model, sampling_args)
+        if not self.outbound_body_denylist:
+            return overridden
+        return {key: value for key, value in overridden.items() if key not in self.outbound_body_denylist}
 
     def _headers(
         self,
@@ -154,9 +174,7 @@ class EvalClient(Client):
         """
         headers = httpx.Headers(incoming if isinstance(dialect, ChatDialect) else None)
         connection = headers.pop("connection", "")
-        for name in _BLOCKED_REQUEST_HEADERS | set(
-            map(str.strip, connection.lower().split(","))
-        ):
+        for name in _BLOCKED_REQUEST_HEADERS | set(map(str.strip, connection.lower().split(","))):
             headers.pop(name, None)
         headers.update(self.headers)
         if session_id:
@@ -171,12 +189,13 @@ class EvalClient(Client):
         headers: httpx.Headers,
         *,
         stream: bool = False,
+        encoded_body: bytes | None = None,
     ) -> httpx.Response:
         headers.setdefault("content-type", "application/json")
         request = self.http.build_request(
             "POST",
             url,
-            content=to_json(body, inf_nan_mode="null"),
+            content=encoded_body or to_json(body, inf_nan_mode="null"),
             headers=headers,
         )
         try:
@@ -203,9 +222,7 @@ class EvalClient(Client):
             text = (await response.aread()).decode("utf-8", errors="replace")
         finally:
             await response.aclose()
-        raise model_error(
-            f"upstream {response.status_code}: {text}", status_code=response.status_code
-        )
+        raise model_error(f"upstream {response.status_code}: {text}", status_code=response.status_code)
 
     async def relay(
         self,
@@ -218,11 +235,14 @@ class EvalClient(Client):
     ) -> RelayReply:
         # Relay complete SSE events so the interception server can safely insert keepalives
         # between them. Error responses are mapped before any event is handed back.
+        outbound_body = self.outbound_body(dialect, body, model, sampling_args)
+        encoded_body = to_json(outbound_body, inf_nan_mode="null")
         resp = await self._request(
             self.base_url + dialect.upstream_path,
-            dialect.apply_overrides(body, model, sampling_args),
+            outbound_body,
             self._headers(dialect, headers, session_id),
             stream=True,
+            encoded_body=encoded_body,
         )
 
         async def chunks():
@@ -239,10 +259,21 @@ class EvalClient(Client):
             if buffer:
                 yield bytes(buffer)
 
+        def finalize_response(response: Response) -> None:
+            validate_requested_token_data(response, outbound_body)
+            if self.capture_model_io:
+                response.pending_model_io = PendingModelIO(
+                    provider_route=dialect.upstream_path,
+                    request_body=from_json(encoded_body),
+                    response_body=response.model_dump(mode="json"),
+                    response_kind="normalized_stream_response",
+                )
+
         return RelayReply(
             content_type=resp.headers.get("content-type", "text/event-stream"),
             chunks=chunks(),
             close=resp.aclose,
+            finalize_response=finalize_response,
         )
 
     async def relay_aux(self, dialect: Dialect, route: str, body: dict) -> dict:

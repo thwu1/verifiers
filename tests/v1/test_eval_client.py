@@ -3,6 +3,9 @@ import math
 
 import httpx
 import pytest
+import verifiers.v1 as vf
+from verifiers.v1 import graph
+from verifiers.v1.clients import EvalClientConfig, resolve_client
 from verifiers.v1.clients.eval import EvalClient
 from verifiers.v1.dialects import ChatDialect
 from verifiers.v1.errors import ProviderError
@@ -148,3 +151,275 @@ async def test_session_id_sets_generic_and_litellm_affinity_headers():
 
     assert headers["X-Session-ID"] == "trajectory-123"
     assert headers["X-LiteLLM-Session-ID"] == "trajectory-123"
+
+
+@pytest.mark.asyncio
+async def test_outbound_body_denylist_is_final_and_top_level(monkeypatch):
+    sent: list[dict] = []
+    client = EvalClient(
+        "http://provider/v1",
+        "secret-key",
+        headers={"X-Provider-Secret": "header-secret"},
+        outbound_body_denylist=[
+            "logprobs",
+            "prompt_logprobs",
+            "top_logprobs",
+            "return_token_ids",
+        ],
+        capture_model_io=True,
+    )
+
+    async def request(url, body, headers, **kwargs):
+        sent.append(body)
+        return httpx.Response(
+            200,
+            content=json.dumps(_completion(token_ids=False)).encode(),
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client, "_request", request)
+    try:
+        response = await client.get_response(
+            ChatDialect(),
+            {
+                "messages": [{"role": "user", "content": "test"}],
+                "logprobs": True,
+                "prompt_logprobs": 1,
+                "top_logprobs": 9,
+                "return_token_ids": True,
+                "metadata": {
+                    "logprobs": True,
+                    "prompt_logprobs": 7,
+                    "return_token_ids": True,
+                },
+            },
+            "model",
+            # These overrides reintroduce fields from sampling before the final denylist.
+            SamplingConfig.model_validate(
+                {
+                    "logprobs": True,
+                    "prompt_logprobs": 2,
+                    "top_logprobs": 4,
+                    "return_token_ids": True,
+                }
+            ),
+        )
+    finally:
+        await client.close()
+
+    assert len(sent) == 1
+    assert (
+        not {
+            "logprobs",
+            "prompt_logprobs",
+            "top_logprobs",
+            "return_token_ids",
+        }
+        & sent[0].keys()
+    )
+    assert sent[0]["metadata"] == {
+        "logprobs": True,
+        "prompt_logprobs": 7,
+        "return_token_ids": True,
+    }
+    # Validation follows what was actually sent, so removed token requirements do not reject a
+    # response without provider token extensions.
+    assert response.tokens is None
+    assert response.pending_model_io is not None
+    assert response.pending_model_io.request_body == sent[0]
+    assert response.pending_model_io.response_body == _completion(token_ids=False)
+    assert response.pending_model_io.response_kind == "exact_provider_json"
+
+    trace = vf.Trace(task=vf.Task(idx=0, prompt="test"))
+    graph.prepare_turn(trace, [vf.UserMessage(content="test")]).commit(response)
+    model_io = next(node.model_io for node in trace.nodes if node.sampled)
+    assert model_io is not None
+    persisted = json.dumps(model_io.model_dump(mode="json"))
+    assert model_io.provider_route == "/chat/completions"
+    assert "secret-key" not in persisted
+    assert "header-secret" not in persisted
+    assert "http://provider" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_default_relay_preserves_generic_provider_fields(monkeypatch):
+    sent: dict = {}
+    client = EvalClient("http://provider/v1", "key")
+
+    async def request(url, body, headers, **kwargs):
+        sent.update(body)
+        return httpx.Response(
+            200,
+            content=json.dumps(_completion(token_ids=False)).encode(),
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client, "_request", request)
+    try:
+        response = await client.get_response(
+            ChatDialect(),
+            {
+                "messages": [{"role": "user", "content": "test"}],
+                "provider_extension": {"enabled": True},
+                "logprobs": False,
+            },
+            "model",
+            SamplingConfig(),
+        )
+    finally:
+        await client.close()
+
+    assert sent["provider_extension"] == {"enabled": True}
+    assert sent["logprobs"] is False
+    assert response.pending_model_io is None
+
+
+@pytest.mark.asyncio
+async def test_capture_matches_serialized_json_semantics(monkeypatch):
+    wire_bodies: list[bytes] = []
+    client = EvalClient("http://provider/v1", "key", capture_model_io=True)
+
+    async def request(url, body, headers, **kwargs):
+        wire_bodies.append(kwargs["encoded_body"])
+        return httpx.Response(
+            200,
+            content=json.dumps(_completion(token_ids=False)).encode(),
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client, "_request", request)
+    try:
+        response = await client.get_response(
+            ChatDialect(),
+            {
+                "messages": [{"role": "user", "content": "test"}],
+                "provider_extension": {"score": math.nan},
+            },
+            "model",
+            SamplingConfig(),
+        )
+    finally:
+        await client.close()
+
+    assert response.pending_model_io is not None
+    assert json.loads(wire_bodies[0]) == response.pending_model_io.request_body
+    assert response.pending_model_io.request_body["provider_extension"] == {"score": None}
+
+
+@pytest.mark.asyncio
+async def test_stream_uses_same_final_denylist_and_captures_request(monkeypatch):
+    sent: list[dict] = []
+    client = EvalClient(
+        "http://provider/v1",
+        "key",
+        outbound_body_denylist=["logprobs", "prompt_logprobs", "top_logprobs"],
+        capture_model_io=True,
+    )
+
+    async def request(url, body, headers, **kwargs):
+        sent.append(body)
+        return httpx.Response(
+            200,
+            content=b"data: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client, "_request", request)
+    try:
+        reply = await client.relay(
+            ChatDialect(),
+            {
+                "stream": True,
+                "messages": [{"role": "user", "content": "test"}],
+                "logprobs": True,
+                "prompt_logprobs": 1,
+                "nested": {"top_logprobs": 5},
+            },
+            "model",
+            SamplingConfig.model_validate({"logprobs": True, "prompt_logprobs": 2, "top_logprobs": 3}),
+        )
+        chunks = [chunk async for chunk in reply.chunks]
+        await reply.close()
+    finally:
+        await client.close()
+
+    assert chunks == [b"data: [DONE]\n\n"]
+    assert not {"logprobs", "prompt_logprobs", "top_logprobs"} & sent[0].keys()
+    assert sent[0]["nested"] == {"top_logprobs": 5}
+    streamed = vf.Response(
+        id="stream",
+        created=1,
+        model="model",
+        message=vf.AssistantMessage(content="ok"),
+        finish_reason="stop",
+    )
+    assert reply.finalize_response is not None
+    reply.finalize_response(streamed)
+    assert streamed.pending_model_io is not None
+    assert streamed.pending_model_io.request_body == sent[0]
+    assert streamed.pending_model_io.response_kind == "normalized_stream_response"
+    assert streamed.pending_model_io.response_body == streamed.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_stream_validates_token_requirements_from_final_body(monkeypatch):
+    client = EvalClient("http://provider/v1", "key")
+
+    async def request(url, body, headers, **kwargs):
+        return httpx.Response(
+            200,
+            content=b"data: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client, "_request", request)
+    try:
+        reply = await client.relay(
+            ChatDialect(),
+            {
+                "stream": True,
+                "messages": [{"role": "user", "content": "test"}],
+                "return_token_ids": True,
+            },
+            "model",
+            SamplingConfig(),
+        )
+        await reply.close()
+    finally:
+        await client.close()
+
+    streamed = vf.Response(
+        id="stream",
+        created=1,
+        model="model",
+        message=vf.AssistantMessage(content="ok"),
+        finish_reason="stop",
+    )
+    assert reply.finalize_response is not None
+    with pytest.raises(ProviderError, match="token IDs/logprobs"):
+        reply.finalize_response(streamed)
+
+
+@pytest.mark.asyncio
+async def test_eval_client_config_resolves_capture_options(monkeypatch):
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "secret")
+    config = EvalClientConfig(
+        base_url="http://provider/v1",
+        api_key_var="TEST_PROVIDER_KEY",
+        outbound_body_denylist=["logprobs"],
+        capture_model_io=True,
+    )
+    client = resolve_client(config)
+    try:
+        assert isinstance(client, EvalClient)
+        assert client.outbound_body_denylist == frozenset({"logprobs"})
+        assert client.capture_model_io is True
+    finally:
+        await client.close()
+
+
+def test_outbound_body_denylist_rejects_transport_field():
+    with pytest.raises(ValueError, match="cannot remove 'stream'"):
+        EvalClientConfig(outbound_body_denylist=["stream"])

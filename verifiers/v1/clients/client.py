@@ -43,6 +43,8 @@ class RelayReply:
     content_type: str
     chunks: AsyncIterator[bytes]
     close: Callable[[], Awaitable[None]]
+    finalize_response: Callable[[Response], None] | None = None
+    """Validate and attach transient capture data to the parsed aggregate after SSE relay."""
 
 
 class Client(ABC):

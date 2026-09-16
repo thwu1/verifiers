@@ -174,9 +174,7 @@ class Branch(StrictBaseModel):
     @property
     def prompt_len(self) -> int:
         """Input context size: the final-turn prompt = full sequence minus the last completion."""
-        last_completion = next(
-            (sum(n.mask) for n in reversed(self.nodes) if any(n.mask)), 0
-        )
+        last_completion = next((sum(n.mask) for n in reversed(self.nodes) if any(n.mask)), 0)
         return self.total_tokens - last_completion
 
     @property
@@ -188,9 +186,7 @@ class Branch(StrictBaseModel):
     def num_prompt_tokens(self) -> int:
         """Final-turn input tokens from provider-reported usage — a fallback for display when
         the endpoint returns no token ids (so `prompt_len` is 0); 0 if no usage was reported."""
-        last = next(
-            (n.usage for n in reversed(self.nodes) if n.usage is not None), None
-        )
+        last = next((n.usage for n in reversed(self.nodes) if n.usage is not None), None)
         return last.input_tokens if last else 0
 
     @property
@@ -242,6 +238,8 @@ class Trace(StrictBaseModel, Generic[TaskT, StateT]):
     _head_index: dict = PrivateAttr(default_factory=dict)
     """`(parent, msg_hash) -> node_id` for the graph builder (`graph.prepare_turn` / `commit`);
     rebuilt lazily from `nodes` after deserialization."""
+    _model_request_cache: tuple[int, dict[str, Any]] | None = PrivateAttr(default=None)
+    """One reconstructed request for O(1) delta capture on the usual linear next turn."""
 
     @property
     def reward(self) -> float:
@@ -340,11 +338,7 @@ class Trace(StrictBaseModel, Generic[TaskT, StateT]):
     def assistant_messages(self) -> list[AssistantMessage]:
         """Every model response, in order — one per turn, branch-independent. Excludes
         prompt-supplied assistant messages (`sampled` is the provenance signal)."""
-        return [
-            n.message
-            for n in self.nodes
-            if n.sampled and isinstance(n.message, AssistantMessage)
-        ]
+        return [n.message for n in self.nodes if n.sampled and isinstance(n.message, AssistantMessage)]
 
     @property
     def tool_messages(self) -> list[ToolMessage]:
@@ -359,9 +353,7 @@ class Trace(StrictBaseModel, Generic[TaskT, StateT]):
         existing metric (a name collision, e.g. an harness and a task metric sharing
         a name) — last writer wins, but loudly."""
         if name in self.metrics:
-            logger.warning(
-                "metric %r overridden: %s -> %s", name, self.metrics[name], value
-            )
+            logger.warning("metric %r overridden: %s -> %s", name, self.metrics[name], value)
         self.metrics[name] = float(value)
 
     def record_metrics(self, values: "Mapping[str, float]") -> None:
@@ -376,9 +368,7 @@ class Trace(StrictBaseModel, Generic[TaskT, StateT]):
         a group reward sharing a name would otherwise silently clobber."""
         contribution = float(value) * float(weight)
         if name in self.rewards:
-            logger.warning(
-                "reward %r overridden: %s -> %s", name, self.rewards[name], contribution
-            )
+            logger.warning("reward %r overridden: %s -> %s", name, self.rewards[name], contribution)
         self.rewards[name] = contribution
 
     def stop(self, condition: str = "done") -> None:
@@ -394,9 +384,7 @@ class Trace(StrictBaseModel, Generic[TaskT, StateT]):
                 message=str(error),
                 # Provider errors already carry the actionable upstream diagnostic.
                 # Keep full tracebacks for every other failure.
-                traceback=None
-                if isinstance(error, ProviderError)
-                else traceback.format_exc(),
+                traceback=None if isinstance(error, ProviderError) else traceback.format_exc(),
             )
         )
         self.stop("error")

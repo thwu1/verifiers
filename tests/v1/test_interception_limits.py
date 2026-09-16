@@ -1,7 +1,12 @@
+from types import SimpleNamespace
+
+import pytest
 from verifiers.v1 import graph
 from verifiers.v1.clients import RolloutContext
+from verifiers.v1.clients.client import RelayReply
+from verifiers.v1.errors import ProviderError
 from verifiers.v1.graph import MessageNode
-from verifiers.v1.interception import RolloutLimits, RolloutSession
+from verifiers.v1.interception import InterceptionServer, RolloutLimits, RolloutSession
 from verifiers.v1.task import Task
 from verifiers.v1.trace import Trace
 from verifiers.v1.types import (
@@ -102,3 +107,84 @@ def test_response_at_hard_total_cap_is_committed():
 
     assert stopped is None
     assert trace.branches[0].total_tokens == 10
+
+
+@pytest.mark.asyncio
+async def test_post_stream_validation_error_is_preserved_on_session(monkeypatch):
+    response = Response(
+        id="stream",
+        created=0,
+        model="model",
+        message=AssistantMessage(content="done"),
+        finish_reason="stop",
+    )
+
+    class Parser:
+        on_done = None
+
+        def feed(self, chunk):
+            pass
+
+        def finish(self):
+            return response
+
+    class Dialect:
+        def stream_parser(self):
+            return Parser()
+
+    async def chunks():
+        yield b'data: {"chunk":true}\n\n'
+
+    async def close():
+        pass
+
+    def reject_missing_tokens(parsed):
+        raise ProviderError("missing requested token IDs")
+
+    class Client:
+        async def relay(self, *args, **kwargs):
+            return RelayReply(
+                content_type="text/event-stream",
+                chunks=chunks(),
+                close=close,
+                finalize_response=reject_missing_tokens,
+            )
+
+    class StreamResponse:
+        def __init__(self, **kwargs):
+            self.content_type = ""
+            self.writes = []
+            self.eof = False
+
+        async def prepare(self, request):
+            pass
+
+        async def write(self, chunk):
+            self.writes.append(chunk)
+
+        async def write_eof(self):
+            self.eof = True
+
+    monkeypatch.setattr("verifiers.v1.interception.server.web.StreamResponse", StreamResponse)
+    trace = Trace(task=Task(idx=0, prompt="test"))
+    session = RolloutSession(
+        ctx=RolloutContext(
+            client=Client(),  # type: ignore[arg-type]
+            model="model",
+            sampling=SamplingConfig(),
+        ),
+        trace=trace,
+    )
+    request = SimpleNamespace(headers={})
+
+    streamed = await InterceptionServer()._stream(
+        request,
+        session,
+        Dialect(),
+        {"stream": True},
+        [UserMessage(content="test")],
+    )
+
+    assert isinstance(session.error, ProviderError)
+    assert trace.nodes == []
+    assert streamed.eof is True

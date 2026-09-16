@@ -55,6 +55,14 @@ from verifiers.v1.mcp import (
     User,
     UserConfig,
 )
+from verifiers.v1.model_io import (
+    DeltaModelRequest,
+    FullModelRequest,
+    ModelIO,
+    ModelResponseCapture,
+    reconstruct_model_request,
+    validate_model_io,
+)
 from verifiers.v1.retries import RetryConfig, RolloutRetryConfig
 from verifiers.v1.rollout import Rollout
 from verifiers.v1.runtimes import (
@@ -132,6 +140,12 @@ __all__ = [
     "State",
     "StateT",
     "MessageNode",
+    "ModelIO",
+    "FullModelRequest",
+    "DeltaModelRequest",
+    "ModelResponseCapture",
+    "reconstruct_model_request",
+    "validate_model_io",
     "Branch",
     "TurnTokens",
     "Timing",
