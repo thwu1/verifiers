@@ -83,8 +83,8 @@ class MessageNode(StrictBaseModel):
     assistant node's completion span); False for template scaffold and every input-message
     token."""
     logprobs: list[float] = Field(default_factory=list)
-    """Sampling logprobs for the sampled tokens — length equals the number of True entries in
-    `mask`; empty for input messages."""
+    """Sampling logprobs for the sampled tokens when requested — length equals the number of
+    True entries in `mask`; empty for input messages and provider runs without logprobs."""
     finish_reason: FinishReason = None
     """The response's finish reason (assistant nodes only) — kept for truncation detection."""
     multi_modal_data: MultiModalData | None = None

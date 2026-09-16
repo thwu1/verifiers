@@ -52,7 +52,12 @@ def load_resume_config(resume_dir: Path) -> EvalConfig:
 def exact_tokens_requested(config: EvalConfig) -> bool:
     """Whether this run explicitly asked the provider for exact token-level training data."""
     sampling = config.sampling.model_dump(exclude_none=True)
-    return sampling.get("return_token_ids") is True
+    return sampling.get("return_token_ids") is True or sampling.get("logprobs") is True
+
+
+def logprobs_requested(config: EvalConfig) -> bool:
+    """Whether persisted sampled-token logprobs are required for this run."""
+    return config.sampling.model_dump(exclude_none=True).get("logprobs") is True
 
 
 def _is_finite_number(value: object) -> bool:
@@ -61,7 +66,7 @@ def _is_finite_number(value: object) -> bool:
     )
 
 
-def _has_exact_tokens(row: dict) -> bool:
+def _has_exact_tokens(row: dict, *, require_logprobs: bool = False) -> bool:
     """Check the persisted graph's token-training invariants without building a ``Trace``."""
     nodes = row.get("nodes")
     if not isinstance(nodes, list) or not nodes:
@@ -84,7 +89,7 @@ def _has_exact_tokens(row: dict) -> bool:
         ):
             return False
         expected_logprobs = sum(mask)
-        if len(logprobs) != expected_logprobs:
+        if len(logprobs) not in ({expected_logprobs} if require_logprobs else {0, expected_logprobs}):
             return False
         if node.get("sampled") is True:
             sampled_tokens += expected_logprobs
@@ -94,7 +99,10 @@ def _has_exact_tokens(row: dict) -> bool:
 
 
 def _read_results(
-    results_path: Path, *, require_exact_tokens: bool = False
+    results_path: Path,
+    *,
+    require_exact_tokens: bool = False,
+    require_logprobs: bool = False,
 ) -> Iterator[tuple[int, int, bool]]:
     """Stream `(file reference, task idx, unusable)` without retaining decoded traces."""
     if not results_path.exists():
@@ -120,7 +128,8 @@ def _read_results(
                             break
                         raise
                 unusable = bool(row.get("errors")) or (
-                    require_exact_tokens and not _has_exact_tokens(row)
+                    require_exact_tokens
+                    and not _has_exact_tokens(row, require_logprobs=require_logprobs)
                 )
                 yield offset, row["task"]["idx"], unusable
 
@@ -132,6 +141,7 @@ def plan(
     group: bool,
     *,
     require_exact_tokens: bool = False,
+    require_logprobs: bool = False,
 ) -> tuple[list[int], dict[int, int]]:
     """Diff the saved results against the run's target (`num_rollouts` per selected task).
     Returns (byte offsets of rows to keep, rollouts owed per task idx). An errored trace is
@@ -141,7 +151,9 @@ def plan(
     selected = set(selected_idxs)
     by_idx: dict[int, list[int]] = defaultdict(list)
     for offset, idx, unusable in _read_results(
-        resume_dir / "results.jsonl", require_exact_tokens=require_exact_tokens
+        resume_dir / "results.jsonl",
+        require_exact_tokens=require_exact_tokens,
+        require_logprobs=require_logprobs,
     ):
         if idx in selected and not unusable and len(by_idx[idx]) < num_rollouts:
             by_idx[idx].append(offset)

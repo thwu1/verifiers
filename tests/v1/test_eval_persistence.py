@@ -45,6 +45,42 @@ def test_resume_keeps_valid_exact_token_row(tmp_path):
     assert owed == {}
 
 
+def test_resume_keeps_exact_token_row_without_unrequested_logprobs(tmp_path):
+    row = _result_row(7, valid_tokens=True)
+    row["nodes"][0]["logprobs"] = []
+    (tmp_path / "results.jsonl").write_text(json.dumps(row) + "\n")
+
+    keep, owed = resume.plan(
+        tmp_path,
+        [7],
+        1,
+        group=False,
+        require_exact_tokens=True,
+        require_logprobs=False,
+    )
+
+    assert keep == [0]
+    assert owed == {}
+
+
+def test_resume_retries_missing_requested_logprobs(tmp_path):
+    row = _result_row(7, valid_tokens=True)
+    row["nodes"][0]["logprobs"] = []
+    (tmp_path / "results.jsonl").write_text(json.dumps(row) + "\n")
+
+    keep, owed = resume.plan(
+        tmp_path,
+        [7],
+        1,
+        group=False,
+        require_exact_tokens=True,
+        require_logprobs=True,
+    )
+
+    assert keep == []
+    assert owed == {7: 1}
+
+
 def test_resume_ignores_only_truncated_final_row(tmp_path):
     complete = json.dumps(_result_row(7, valid_tokens=True)).encode()
     (tmp_path / "results.jsonl").write_bytes(complete + b'\n{"task":{"idx":8},"nodes":[')
@@ -89,6 +125,17 @@ def test_resume_token_validation_is_enabled_by_provider_request():
     )
 
     assert resume.exact_tokens_requested(config)
+    assert resume.logprobs_requested(config)
+
+
+def test_resume_token_ids_without_logprobs_are_validated_independently():
+    config = EvalConfig(
+        rich=False,
+        sampling={"return_token_ids": True, "logprobs": False},
+    )
+
+    assert resume.exact_tokens_requested(config)
+    assert not resume.logprobs_requested(config)
 
 
 @pytest.mark.asyncio

@@ -49,6 +49,7 @@ async def run_eval(env: Environment, config: EvalConfig) -> list[Trace]:
             config.num_rollouts,
             group,
             require_exact_tokens=resume.exact_tokens_requested(config),
+            require_logprobs=resume.logprobs_requested(config),
         )
         if not owed:  # already complete - report it and exit successfully
             print(resume.nothing_to_resume_msg(out, len(tasks), config.num_rollouts))
@@ -174,6 +175,7 @@ async def run_eval_server(config: EvalConfig) -> list[Trace]:
                 config.num_rollouts,
                 info.requires_group_scoring,
                 require_exact_tokens=resume.exact_tokens_requested(config),
+                require_logprobs=resume.logprobs_requested(config),
             )
             if not owed:  # already complete - report it and exit successfully
                 print(resume.nothing_to_resume_msg(out, len(idxs), config.num_rollouts))
