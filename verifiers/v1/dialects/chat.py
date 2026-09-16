@@ -53,7 +53,7 @@ def _provider_value(value: Any, field: str) -> Any:
 
 
 def _response_tokens(completion: ChatCompletion) -> TurnTokens | None:
-    """Parse vLLM token IDs and sampled logprobs when the provider returns them."""
+    """Parse vLLM token IDs, plus sampled logprobs when the provider returns them."""
     choice = completion.choices[0]
     prompt_ids = _provider_value(completion, "prompt_token_ids")
     completion_ids = _provider_value(choice, "token_ids")
@@ -69,11 +69,11 @@ def _response_tokens(completion: ChatCompletion) -> TurnTokens | None:
         return None
 
     content_logprobs = choice.logprobs.content if choice.logprobs else None
-    if content_logprobs is None:
-        return None
-    completion_logprobs = [token.logprob for token in content_logprobs]
-    if len(completion_logprobs) != len(completion_ids):
-        return None
+    completion_logprobs: list[float] = []
+    if content_logprobs is not None:
+        completion_logprobs = [token.logprob for token in content_logprobs]
+        if len(completion_logprobs) != len(completion_ids):
+            return None
     return TurnTokens(
         prompt_ids=prompt_ids,
         completion_ids=completion_ids,

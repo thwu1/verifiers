@@ -115,6 +115,30 @@ async def test_requested_exact_tokens_are_accepted_when_aligned(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_requested_token_ids_are_accepted_without_logprobs(monkeypatch):
+    response = await _response(
+        monkeypatch,
+        _completion(),
+        {"return_token_ids": True, "logprobs": False},
+    )
+
+    assert response.tokens is not None
+    assert response.tokens.prompt_ids == [10, 11]
+    assert response.tokens.completion_ids == [20]
+    assert response.tokens.completion_logprobs == []
+
+
+@pytest.mark.asyncio
+async def test_requested_logprobs_fail_when_absent(monkeypatch):
+    with pytest.raises(ProviderError, match="missing, misaligned"):
+        await _response(
+            monkeypatch,
+            _completion(),
+            {"return_token_ids": True, "logprobs": True},
+        )
+
+
+@pytest.mark.asyncio
 async def test_session_id_sets_generic_and_litellm_affinity_headers():
     client = EvalClient("http://provider/v1", "key")
     try:
