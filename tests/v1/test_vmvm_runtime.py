@@ -18,6 +18,8 @@ class FakeBackend:
         self.destroyed = False
         self.restart_calls = 0
         self.restart_result = True
+        self.network_prepare_calls = 0
+        self.network_activate_calls = 0
         self.recovery_results: list[vmvm.VMVMBashResult | None] = []
         self.result: vmvm.VMVMBashResult = {
             "status": "success",
@@ -42,6 +44,12 @@ class FakeBackend:
 
     def read_file(self, remote_path: str) -> bytes:
         return self.files[remote_path]
+
+    def prepare_network_isolation(self) -> None:
+        self.network_prepare_calls += 1
+
+    def activate_network_isolation(self) -> None:
+        self.network_activate_calls += 1
 
     def open_host_tunnel(self, local_port: int) -> tuple[object, str]:
         tunnel = object()
@@ -96,6 +104,45 @@ async def test_vmvm_runtime_lifecycle(monkeypatch) -> None:
 
     await runtime.stop()
     assert backend.destroyed is True
+
+
+async def test_vmvm_runtime_activates_network_before_deferred_startup_and_program(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+    events: list[str] = []
+
+    def activate() -> None:
+        backend.network_activate_calls += 1
+        events.append("activate")
+
+    def run_bash(command: str, timeout: float = 60.0) -> vmvm.VMVMBashResult:
+        backend.commands.append((command, timeout))
+        if "start-service" in command:
+            events.append("startup")
+        if "run-agent" in command:
+            events.append("program")
+        return backend.result
+
+    backend.activate_network_isolation = activate
+    backend.run_bash = run_bash
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+
+    await runtime.configure_network_policy("no-network")
+    runtime.defer_until_network_isolated(["start-service"])
+    async with runtime.host_endpoint(4321):
+        result = await runtime.run_program(["run-agent"], {})
+
+    assert result.exit_code == 0
+    assert backend.network_prepare_calls == 1
+    assert events == ["activate", "startup", "program"]
+
+    with pytest.raises(SandboxError, match="cannot relax"):
+        await runtime.configure_network_policy("public")
+
+    await runtime.stop()
 
 
 async def test_vmvm_runtime_does_not_recover_command_timeout(monkeypatch) -> None:

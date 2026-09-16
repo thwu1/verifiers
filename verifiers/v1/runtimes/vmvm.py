@@ -35,6 +35,10 @@ class VMVMBackend(Protocol):
 
     def read_file(self, remote_path: str) -> bytes: ...
 
+    def prepare_network_isolation(self) -> None: ...
+
+    def activate_network_isolation(self) -> None: ...
+
     def open_host_tunnel(self, local_port: int) -> tuple[object, str]: ...
 
     def close_host_tunnel(self, tunnel: object) -> None: ...
@@ -116,6 +120,10 @@ class VMVMRuntime(Runtime):
         self._backend: VMVMBackend | None = None
         self._descriptor: str | None = None
         self._run_lock = asyncio.Lock()
+        self._network_lock = asyncio.Lock()
+        self._network_mode: Literal["public", "no-network"] = "public"
+        self._network_active = False
+        self._deferred_network_commands: list[tuple[list[str], dict[str, str]]] = []
 
     @property
     def descriptor(self) -> str | None:
@@ -192,6 +200,54 @@ class VMVMRuntime(Runtime):
         if result.exit_code != 0:
             raise SandboxError(f"VMVM background launch failed: {result.stdout.strip()}")
 
+    async def configure_network_policy(
+        self,
+        mode: Literal["public", "no-network"],
+    ) -> None:
+        """Prepare a monotonic public-to-isolated network policy transition."""
+        if mode == self._network_mode:
+            return
+        if self._network_mode == "no-network":
+            raise SandboxError("VMVM cannot relax an active no-network policy back to public")
+        try:
+            await asyncio.to_thread(self.backend.prepare_network_isolation)
+        except Exception as error:
+            raise SandboxError(f"VMVM network-isolation preparation failed: {error}") from error
+        self._network_mode = "no-network"
+
+    def defer_until_network_isolated(
+        self,
+        argv: list[str],
+        env: dict[str, str] | None = None,
+    ) -> None:
+        if self._network_mode != "no-network":
+            raise RuntimeError("deferred startup requires a no-network policy")
+        self._deferred_network_commands.append((list(argv), dict(env or {})))
+
+    async def activate_network_policy(self) -> None:
+        """Tighten the prepared workload network before untrusted execution."""
+        if self._network_mode != "no-network":
+            return
+        async with self._network_lock:
+            if not self._network_active:
+                try:
+                    await asyncio.to_thread(self.backend.activate_network_isolation)
+                except Exception as error:
+                    raise SandboxError(f"VMVM network-isolation activation failed: {error}") from error
+                self._network_active = True
+            commands, self._deferred_network_commands = (
+                self._deferred_network_commands,
+                [],
+            )
+            for argv, env in commands:
+                result = await self.run(argv, env)
+                if result.exit_code != 0:
+                    raise SandboxError(f"VMVM deferred isolated startup failed: {result.stdout[-2000:]}")
+
+    async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+        await self.activate_network_policy()
+        return await self.run(argv, env)
+
     def absolute_path(self, path: str) -> str:
         target = PurePosixPath(path)
         if target.is_absolute():
@@ -219,6 +275,7 @@ class VMVMRuntime(Runtime):
 
         tunnel, url = await open_tunnel(start, f"VMVM host tunnel (port {port})")
         try:
+            await self.activate_network_policy()
             yield url
         finally:
             await asyncio.to_thread(self.backend.close_host_tunnel, tunnel)
