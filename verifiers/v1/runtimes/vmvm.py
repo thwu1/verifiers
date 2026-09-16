@@ -6,15 +6,26 @@ import logging
 import shlex
 from pathlib import PurePosixPath
 from typing import ClassVar, Literal, Protocol, TypedDict
+from urllib.parse import urlsplit
 
 from pydantic import Field
 from pydantic_config import BaseConfig
 
-from verifiers.v1.errors import SandboxError
+from verifiers.v1.errors import SandboxError, TunnelError
 from verifiers.v1.runtimes.base import ProgramResult, Runtime, open_tunnel
 
 logger = logging.getLogger(__name__)
 MAX_TRANSPORT_RECOVERY_ATTEMPTS = 5
+ISOLATED_PROGRAM_ENV = {
+    "HTTP_PROXY": "",
+    "HTTPS_PROXY": "",
+    "ALL_PROXY": "",
+    "http_proxy": "",
+    "https_proxy": "",
+    "all_proxy": "",
+    "NO_PROXY": "*",
+    "no_proxy": "*",
+}
 
 
 class VMVMBashResult(TypedDict):
@@ -157,6 +168,8 @@ class VMVMRuntime(Runtime):
         logger.info("vmvm: container %s up (image=%s)", self._descriptor, self.config.image)
 
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+        if self._network_active:
+            env = {**env, **ISOLATED_PROGRAM_ENV}
         command = shell_command(argv, env, self.config.workdir)
         async with self._run_lock:
             try:
@@ -276,6 +289,26 @@ class VMVMRuntime(Runtime):
         tunnel, url = await open_tunnel(start, f"VMVM host tunnel (port {port})")
         try:
             await self.activate_network_policy()
+            if self._network_active:
+                endpoint = urlsplit(url)
+                if endpoint.hostname is None or endpoint.port is None:
+                    raise TunnelError("VMVM host tunnel returned an invalid URL")
+                probe = (
+                    "if command -v python3 >/dev/null 2>&1; then "
+                    f"exec python3 -c {shlex.quote(f'import socket; socket.create_connection(({endpoint.hostname!r}, {endpoint.port}), timeout=5).close()')}; "
+                    "elif command -v python >/dev/null 2>&1; then "
+                    f"exec python -c {shlex.quote(f'import socket; socket.create_connection(({endpoint.hostname!r}, {endpoint.port}), timeout=5).close()')}; "
+                    "elif command -v nc >/dev/null 2>&1; then "
+                    f"exec nc -z -w 5 {shlex.quote(endpoint.hostname)} {endpoint.port}; "
+                    "elif command -v busybox >/dev/null 2>&1; then "
+                    f"exec busybox nc -z -w 5 {shlex.quote(endpoint.hostname)} {endpoint.port}; "
+                    "else exit 125; fi"
+                )
+                result = await self.run(["sh", "-c", probe], {})
+                if result.exit_code != 0:
+                    raise TunnelError(
+                        f"VMVM host tunnel was unreachable after no-network activation (probe exit {result.exit_code})"
+                    )
             yield url
         finally:
             await asyncio.to_thread(self.backend.close_host_tunnel, tunnel)

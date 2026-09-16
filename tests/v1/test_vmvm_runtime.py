@@ -138,6 +138,11 @@ async def test_vmvm_runtime_activates_network_before_deferred_startup_and_progra
     assert result.exit_code == 0
     assert backend.network_prepare_calls == 1
     assert events == ["activate", "startup", "program"]
+    isolated_commands = [command for command, _ in backend.commands if "NO_PROXY=*" in command]
+    assert len(isolated_commands) == 3
+    assert any("socket.create_connection" in command for command in isolated_commands)
+    assert any("start-service" in command for command in isolated_commands)
+    assert any("run-agent" in command for command in isolated_commands)
 
     with pytest.raises(SandboxError, match="cannot relax"):
         await runtime.configure_network_policy("public")
