@@ -253,6 +253,23 @@ class PendingTurn:
         return self.prompt[self.tail_start :]
 
     @property
+    def accounted_path_len(self) -> int:
+        """Best known token length of the reused prefix.
+
+        Exact token arrays are authoritative when present. Eval providers may
+        intentionally omit them, in which case the latest sampled node's
+        provider usage is a lower bound for the next prompt: its prior prompt
+        and completion are both part of the reused conversation.
+        """
+        usage_total = 0
+        for node_id in reversed(self.prefix_node_ids):
+            usage = self.trace.nodes[node_id].usage
+            if usage is not None:
+                usage_total = usage.total_tokens
+                break
+        return max(self.path_len, usage_total)
+
+    @property
     def parent(self) -> int | None:
         return self.prefix_node_ids[-1] if self.prefix_node_ids else None
 

@@ -163,19 +163,44 @@ class Branch(StrictBaseModel):
 
     @property
     def completion_len(self) -> int:
-        """All assistant-generated (model-sampled) tokens across this branch."""
-        return sum(sum(n.mask) for n in self.nodes)
+        """All assistant-generated tokens, using provider usage when IDs are absent."""
+        return sum(
+            sum(node.mask)
+            if node.token_ids or node.mask
+            else node.usage.completion_tokens
+            if node.sampled and node.usage is not None
+            else 0
+            for node in self.nodes
+        )
 
     @property
     def total_tokens(self) -> int:
-        """This branch's full sequence length (final-turn prompt + every completion)."""
-        return sum(len(n.token_ids) for n in self.nodes)
+        """This branch's latest sequence length, with provider-usage fallback."""
+        exact = sum(len(node.token_ids) for node in self.nodes)
+        last_usage = next(
+            (
+                node.usage
+                for node in reversed(self.nodes)
+                if node.sampled and node.usage is not None
+            ),
+            None,
+        )
+        return max(exact, last_usage.total_tokens if last_usage is not None else 0)
 
     @property
     def prompt_len(self) -> int:
-        """Input context size: the final-turn prompt = full sequence minus the last completion."""
+        """Latest input context size, with provider-usage fallback."""
         last_completion = next((sum(n.mask) for n in reversed(self.nodes) if any(n.mask)), 0)
-        return self.total_tokens - last_completion
+        exact = sum(len(node.token_ids) for node in self.nodes) - last_completion
+        last_usage = next(
+            (
+                node.usage
+                for node in reversed(self.nodes)
+                if node.sampled and node.usage is not None
+            ),
+            None,
+        )
+        return max(exact, last_usage.input_tokens if last_usage is not None else 0)
 
     @property
     def usage(self) -> Usage | None:

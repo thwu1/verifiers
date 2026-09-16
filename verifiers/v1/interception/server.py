@@ -379,7 +379,9 @@ class InterceptionServer:
                     return web.json_response(dialect.error_body(f"rollout stopped: {refused}"), status=400)
                 return _completion_response(completion)
             turn = graph.prepare_turn(session.trace, prompt)
-            sampling, refused = session.sampling_for(prompt_prefix_tokens=turn.path_len)
+            sampling, refused = session.sampling_for(
+                prompt_prefix_tokens=turn.accounted_path_len
+            )
             if refused is not None:
                 if completion is None:
                     return web.json_response(dialect.error_body(f"rollout stopped: {refused}"), status=400)
@@ -490,7 +492,9 @@ class InterceptionServer:
         session.error = None
         try:
             turn = graph.prepare_turn(session.trace, prompt)
-            sampling, refused = session.sampling_for(prompt_prefix_tokens=turn.path_len)
+            sampling, refused = session.sampling_for(
+                prompt_prefix_tokens=turn.accounted_path_len
+            )
             if refused is not None:
                 return web.json_response(dialect.error_body(f"rollout stopped: {refused}"), status=400)
             reply = await session.ctx.client.relay(

@@ -14,6 +14,7 @@ from verifiers.v1.types import (
     Response,
     SamplingConfig,
     TurnTokens,
+    Usage,
     UserMessage,
 )
 
@@ -30,6 +31,17 @@ def _response(prompt: int, completion: int) -> Response:
             completion_ids=list(range(completion)),
             completion_logprobs=[-0.1] * completion,
         ),
+    )
+
+
+def _usage_response(prompt: int, completion: int) -> Response:
+    return Response(
+        id="response",
+        created=0,
+        model="model",
+        message=AssistantMessage(content="done"),
+        finish_reason="stop",
+        usage=Usage(prompt_tokens=prompt, completion_tokens=completion),
     )
 
 
@@ -107,6 +119,45 @@ def test_response_at_hard_total_cap_is_committed():
 
     assert stopped is None
     assert trace.branches[0].total_tokens == 10
+
+
+def test_provider_usage_clamps_next_request_without_token_ids():
+    trace = Trace(task=Task(idx=0, prompt="test"))
+    session = _session(trace, RolloutLimits(max_output_tokens=6, max_total_tokens=12))
+    prompt = [UserMessage(content="test")]
+    session.commit(graph.prepare_turn(trace, prompt), _usage_response(prompt=7, completion=3))
+
+    next_turn = graph.prepare_turn(
+        trace,
+        [*prompt, AssistantMessage(content="done"), UserMessage(content="next")],
+    )
+    sampling, stopped = session.sampling_for(
+        prompt_prefix_tokens=next_turn.accounted_path_len
+    )
+
+    assert next_turn.path_len == 0
+    assert next_turn.accounted_path_len == 10
+    assert trace.prompt_len == 7
+    assert trace.completion_len == 3
+    assert trace.total_tokens == 10
+    assert stopped is None
+    assert sampling.max_tokens == 2
+
+
+def test_provider_usage_stops_before_request_at_total_cap():
+    trace = Trace(task=Task(idx=0, prompt="test"))
+    session = _session(trace, RolloutLimits(max_total_tokens=10))
+    prompt = [UserMessage(content="test")]
+    session.commit(graph.prepare_turn(trace, prompt), _usage_response(prompt=7, completion=3))
+    next_turn = graph.prepare_turn(
+        trace,
+        [*prompt, AssistantMessage(content="done"), UserMessage(content="next")],
+    )
+
+    _, stopped = session.sampling_for(prompt_prefix_tokens=next_turn.accounted_path_len)
+
+    assert stopped == "max_total_tokens"
+    assert trace.stop_condition == "max_total_tokens"
 
 
 @pytest.mark.asyncio
