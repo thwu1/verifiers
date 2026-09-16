@@ -293,15 +293,24 @@ class VMVMRuntime(Runtime):
                 endpoint = urlsplit(url)
                 if endpoint.hostname is None or endpoint.port is None:
                     raise TunnelError("VMVM host tunnel returned an invalid URL")
+                python_probe = (
+                    "import socket; "
+                    f"s=socket.create_connection(({endpoint.hostname!r}, {endpoint.port}), timeout=5); "
+                    "s.settimeout(5); "
+                    "s.sendall(b'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'); "
+                    "data=s.recv(16); s.close(); assert data.startswith(b'HTTP/')"
+                )
+                shell_probe = shlex.quote("printf 'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'")
                 probe = (
                     "if command -v python3 >/dev/null 2>&1; then "
-                    f"exec python3 -c {shlex.quote(f'import socket; socket.create_connection(({endpoint.hostname!r}, {endpoint.port}), timeout=5).close()')}; "
+                    f"exec python3 -c {shlex.quote(python_probe)}; "
                     "elif command -v python >/dev/null 2>&1; then "
-                    f"exec python -c {shlex.quote(f'import socket; socket.create_connection(({endpoint.hostname!r}, {endpoint.port}), timeout=5).close()')}; "
+                    f"exec python -c {shlex.quote(python_probe)}; "
                     "elif command -v nc >/dev/null 2>&1; then "
-                    f"exec nc -z -w 5 {shlex.quote(endpoint.hostname)} {endpoint.port}; "
+                    f"{shell_probe} | nc -w 5 {shlex.quote(endpoint.hostname)} {endpoint.port} | head -c 5 | grep -q '^HTTP/'; "
                     "elif command -v busybox >/dev/null 2>&1; then "
-                    f"exec busybox nc -z -w 5 {shlex.quote(endpoint.hostname)} {endpoint.port}; "
+                    f"{shell_probe} | busybox nc -w 5 {shlex.quote(endpoint.hostname)} {endpoint.port} | "
+                    "head -c 5 | grep -q '^HTTP/'; "
                     "else exit 125; fi"
                 )
                 result = await self.run(["sh", "-c", probe], {})
