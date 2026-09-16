@@ -73,7 +73,14 @@ class Episode:
             await trim_memory_periodically()
             return trace if group_scored or retain_traces else None
 
-        completed = await asyncio.gather(*(run_one(r) for r in self.rollouts))
+        running = [asyncio.create_task(run_one(rollout)) for rollout in self.rollouts]
+        try:
+            completed = await asyncio.gather(*running)
+        except BaseException:
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            raise
         traces = [trace for trace in completed if trace is not None]
         if group_scored:
             await self.taskset.score_group(traces)  # cross-rollout @group_rewards

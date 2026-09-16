@@ -94,16 +94,23 @@ async def run_eval(env: Environment, config: EvalConfig) -> list[Trace]:
             else contextlib.nullcontext()
         )
         async with display:
-            results = await asyncio.gather(
-                *(
+            running = [
+                asyncio.create_task(
                     episode.run(
                         semaphore,
                         on_complete,
                         retain_traces=config.retain_traces,
                     )
-                    for episode in episodes
                 )
-            )
+                for episode in episodes
+            ]
+            try:
+                results = await asyncio.gather(*running)
+            except BaseException:
+                for task in running:
+                    task.cancel()
+                await asyncio.gather(*running, return_exceptions=True)
+                raise
     traces = [trace for episode_traces in results for trace in episode_traces]
     await client.close()
     return traces

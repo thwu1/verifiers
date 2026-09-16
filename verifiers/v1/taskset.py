@@ -23,13 +23,13 @@ from pydantic_config import BaseConfig
 
 from verifiers.v1.decorators import discover_decorated, invoke
 from verifiers.v1.errors import TasksetError, boundary
-from verifiers.v1.types import EnvId
-from verifiers.v1.utils.install import env_name
-from verifiers.v1.runtimes import Runtime
 from verifiers.v1.mcp import Toolset, User
+from verifiers.v1.runtimes import Runtime
 from verifiers.v1.state import StateT
 from verifiers.v1.task import TaskT
 from verifiers.v1.trace import Trace
+from verifiers.v1.types import EnvId
+from verifiers.v1.utils.install import env_name
 
 
 class TasksetConfig(BaseConfig):
@@ -92,6 +92,19 @@ class Taskset(Generic[TaskT, ConfigT, StateT]):
         agent's diff, run a build, snapshot state, scrape runtime artifacts into `trace.info`.
         Runs while the runtime is still live (after generation, before `@reward`/`@metric`); the
         symmetric counterpart to `setup`. Errors propagate and fail the rollout."""
+        return None
+
+    async def cleanup(self, task: TaskT, trace: Trace | None, runtime: Runtime) -> None:
+        """Release taskset-owned per-rollout state before ``runtime`` is stopped.
+
+        This hook runs on every terminal path, including partial setup, stage failures,
+        and cancellation. ``trace`` is ``None`` for model-free validation. Implementations
+        must be idempotent because they may see partially initialized state.
+        """
+        return None
+
+    async def close(self) -> None:
+        """Release taskset-wide resources after all evaluator rollouts terminate."""
         return None
 
     async def validate(self, task: TaskT, runtime: Runtime) -> bool:

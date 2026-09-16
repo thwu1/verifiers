@@ -84,9 +84,22 @@ async def _validate_task(taskset: Taskset, task, config: ValidateConfig) -> dict
         exc = e
     finally:
         try:
-            await runtime.stop()
-        except Exception:
-            logger.warning("runtime teardown failed (task %s)", task.idx, exc_info=True)
+            try:
+                await taskset.cleanup(task, None, runtime)
+            except Exception as cleanup_error:
+                if exc is None:
+                    valid, exc = False, cleanup_error
+                else:
+                    logger.warning(
+                        "taskset cleanup failed after task %s already failed",
+                        task.idx,
+                        exc_info=True,
+                    )
+        finally:
+            try:
+                await runtime.stop()
+            except Exception:
+                logger.warning("runtime teardown failed (task %s)", task.idx, exc_info=True)
     return {
         "index": task.idx,
         "name": task.name,
@@ -142,8 +155,18 @@ async def run_validate(config: ValidateConfig) -> list[dict]:
         return row
 
     display = validate_dashboard(states, config, time.time()) if config.rich else contextlib.nullcontext()
-    async with display:
-        return await asyncio.gather(*(_one(t) for t in tasks))
+    try:
+        async with display:
+            running = [asyncio.create_task(_one(task)) for task in tasks]
+            try:
+                return await asyncio.gather(*running)
+            except BaseException:
+                for task in running:
+                    task.cancel()
+                await asyncio.gather(*running, return_exceptions=True)
+                raise
+    finally:
+        await taskset.close()
 
 
 def main(argv: list[str] | None = None) -> None:

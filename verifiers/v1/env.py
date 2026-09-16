@@ -324,17 +324,20 @@ class Environment:
         every `episode()` built inside this context injects them into its rollouts — that's
         what keeps both eval runners (in-process and env-server) on one serving path. Build
         episodes inside this context; the resources are torn down on exit."""
-        async with (
-            self.shared_tools(tasks) as shared_urls,
-            self.interception_pool() as interception,
-        ):
-            self._shared_urls = shared_urls
-            self._interception = interception
-            try:
-                yield
-            finally:
-                self._shared_urls = {}
-                self._interception = None
+        try:
+            async with (
+                self.shared_tools(tasks) as shared_urls,
+                self.interception_pool() as interception,
+            ):
+                self._shared_urls = shared_urls
+                self._interception = interception
+                try:
+                    yield
+                finally:
+                    self._shared_urls = {}
+                    self._interception = None
+        finally:
+            await self.taskset.close()
 
     def interception_pool(self) -> InterceptionPool:
         """The shared interception pool for this env's rollouts — one server (+ tunnel

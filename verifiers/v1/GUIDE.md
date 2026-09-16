@@ -272,16 +272,18 @@ trace (above) or from per-rollout state set by a tool / user sim (see [State](#p
 
 ## Lifecycle hooks
 
-A rollout runs **`setup → harness → finalize → scoring`**. A taskset can hook any stage:
+A rollout runs **`setup → harness → finalize → scoring → cleanup`**. A taskset can hook any stage:
 
 | hook | signature | when | gets runtime? |
 | --- | --- | --- | --- |
 | `setup` | `(self, task, runtime)` | per-task prep before the harness (clone a repo, start a service) — the trace doesn't exist yet | ✓ |
 | `finalize` | `(self, task, trace, runtime)` | after the harness, before scoring — apply a diff, snapshot, scrape artifacts into `trace.info` | ✓ |
+| `cleanup` | `(self, task, trace, runtime)` | every rollout terminal path, before runtime teardown (`trace=None` during validation) | ✓ |
+| `close` | `(self)` | once after all evaluator rollouts and shared serving resources stop | ✗ |
 | `tools` | `(self, task) -> list[vf.Toolset]` | per task, before the harness — the task's tool servers | ✗ |
 | `user` | `(self, task) -> vf.User \| None` | per task, before the harness — the user simulator | ✗ |
 
-`setup`/`finalize` errors fail the rollout legibly (captured onto the trace, not a crash).
+`setup`/`finalize`/`cleanup` errors fail the rollout legibly (captured onto the trace, not a crash).
 
 ## Runtime access
 

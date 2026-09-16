@@ -34,9 +34,14 @@ Episode (task, n)
    │     └─ model calls → interception server → client → graph.add_turn()
    ├─ taskset.finalize(task, trace, runtime)  # Phase.FINALIZE— wait_for(finalize_timeout)
    ├─ taskset.score + harness.score           # Phase.SCORING — wait_for(scoring_timeout)
+   ├─ taskset.cleanup(task, trace, runtime)   # every terminal path
    └─ runtime.stop()                          # guaranteed teardown (also atexit-guarded)
    ⤷ Episode then runs @group_reward across the task's N traces
 ```
+
+After all episodes and shared serving resources have stopped, the evaluator calls
+`taskset.close()` once to release taskset-wide caches. Both cleanup hooks also run
+during graceful cancellation.
 
 Each stage is bounded by its own `asyncio.wait_for` (`rollout.py`), so a wedge in any one
 phase is a budget event, not a hang — a `harness_timeout` scores what's there; a

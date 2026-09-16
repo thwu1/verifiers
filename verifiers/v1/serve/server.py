@@ -210,6 +210,8 @@ class EnvServer:
             finally:
                 for task in tasks:
                     task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 for client in self._clients.values():
                     with contextlib.suppress(Exception):
                         await client.close()

@@ -269,12 +269,27 @@ class Rollout:
                 trace.timing.generation.end = now  # error mid-run: close generation
             if trace.timing.finalize.start and not trace.timing.finalize.end:
                 trace.timing.finalize.end = now  # error mid-finalize: close finalize
-            # Tear down here — group rewards (later) need only the trace, not a live
-            # runtime. `runtime` is always set: make_runtime() ran before the `try`.
             try:
-                await runtime.stop()
-            except Exception:
-                logger.warning("runtime teardown failed (rollout %s)", trace.id, exc_info=True)
+                try:
+                    async with boundary(TasksetError, "taskset cleanup"):
+                        await self.taskset.cleanup(self.task, trace, runtime)
+                except RolloutError as error:
+                    if trace.error is None:
+                        trace.capture_error(error)
+                    else:
+                        logger.warning(
+                            "taskset cleanup failed after rollout %s already failed: %s",
+                            trace.id,
+                            error,
+                            exc_info=True,
+                        )
+            finally:
+                # Group rewards (later) need only the trace, not a live runtime.
+                # `runtime` is always set: make_runtime() ran before the `try`.
+                try:
+                    await runtime.stop()
+                except Exception:
+                    logger.warning("runtime teardown failed (rollout %s)", trace.id, exc_info=True)
         logger.info(
             "rollout done: id=%s task=%s reward=%.3f turns=%d stop=%s",
             trace.id,
