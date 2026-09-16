@@ -14,6 +14,7 @@ from verifiers.v1.errors import SandboxError
 from verifiers.v1.runtimes.base import ProgramResult, Runtime, open_tunnel
 
 logger = logging.getLogger(__name__)
+MAX_TRANSPORT_RECOVERY_ATTEMPTS = 5
 
 
 class VMVMBashResult(TypedDict):
@@ -25,6 +26,10 @@ class VMVMBashResult(TypedDict):
 
 class VMVMBackend(Protocol):
     def run_bash(self, command: str, timeout: float = 60.0) -> VMVMBashResult: ...
+
+    def restart_session(self) -> bool: ...
+
+    def recover_last(self) -> VMVMBashResult | None: ...
 
     def transfer_file(self, file_content: str | bytes, remote_path: str) -> None: ...
 
@@ -145,11 +150,38 @@ class VMVMRuntime(Runtime):
 
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         command = shell_command(argv, env, self.config.workdir)
-        try:
-            async with self._run_lock:
+        async with self._run_lock:
+            try:
                 result = await asyncio.to_thread(self.backend.run_bash, command, self.config.session_timeout)
-        except Exception as error:
-            raise SandboxError(f"VMVM exec failed: {error}") from error
+            except Exception as error:
+                raise SandboxError(f"VMVM exec failed: {error}") from error
+
+            for attempt in range(1, MAX_TRANSPORT_RECOVERY_ATTEMPTS + 1):
+                if result["exit_code"] >= 0 or result["error_type"] != "broken_pipe":
+                    break
+                logger.warning(
+                    "vmvm: transport dropped; recovering the in-flight command (%d/%d)",
+                    attempt,
+                    MAX_TRANSPORT_RECOVERY_ATTEMPTS,
+                )
+                try:
+                    restarted = await asyncio.to_thread(self.backend.restart_session)
+                except Exception as error:
+                    raise SandboxError(f"VMVM reconnect failed: {error}") from error
+                if not restarted:
+                    raise SandboxError("VMVM reconnect failed: sandbox state is unavailable")
+                try:
+                    recovered = await asyncio.to_thread(self.backend.recover_last)
+                except Exception as error:
+                    raise SandboxError(f"VMVM command recovery failed: {error}") from error
+                if recovered is None:
+                    raise SandboxError("VMVM command recovery failed: exact-once execution cannot be proven")
+                result = recovered
+            if result["exit_code"] < 0 and result["error_type"] == "broken_pipe":
+                raise SandboxError(
+                    "VMVM exec failed: transport remained unavailable after "
+                    f"{MAX_TRANSPORT_RECOVERY_ATTEMPTS} recovery attempts"
+                )
         if result["exit_code"] < 0:
             raise SandboxError(f"VMVM exec failed ({result['error_type']}): {result['output']}")
         return ProgramResult(exit_code=result["exit_code"], stdout=result["output"], stderr="")

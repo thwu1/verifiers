@@ -16,6 +16,9 @@ class FakeBackend:
         self.files: dict[str, bytes] = {}
         self.open_tunnels: list[object] = []
         self.destroyed = False
+        self.restart_calls = 0
+        self.restart_result = True
+        self.recovery_results: list[vmvm.VMVMBashResult | None] = []
         self.result: vmvm.VMVMBashResult = {
             "status": "success",
             "output": "ok",
@@ -26,6 +29,13 @@ class FakeBackend:
     def run_bash(self, command: str, timeout: float = 60.0) -> vmvm.VMVMBashResult:
         self.commands.append((command, timeout))
         return self.result
+
+    def restart_session(self) -> bool:
+        self.restart_calls += 1
+        return self.restart_result
+
+    def recover_last(self) -> vmvm.VMVMBashResult | None:
+        return self.recovery_results.pop(0)
 
     def transfer_file(self, file_content: str | bytes, remote_path: str) -> None:
         self.files[remote_path] = file_content.encode() if isinstance(file_content, str) else file_content
@@ -88,7 +98,27 @@ async def test_vmvm_runtime_lifecycle(monkeypatch) -> None:
     assert backend.destroyed is True
 
 
-async def test_vmvm_runtime_surfaces_transport_failure(monkeypatch) -> None:
+async def test_vmvm_runtime_does_not_recover_command_timeout(monkeypatch) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+    backend.result = {
+        "status": "error",
+        "output": "command timed out",
+        "error_type": "timeout",
+        "exit_code": -1,
+    }
+
+    with pytest.raises(SandboxError, match="timeout"):
+        await runtime.run(["true"], {})
+
+    assert backend.restart_calls == 0
+
+    await runtime.stop()
+
+
+async def test_vmvm_runtime_recovers_in_flight_command_exactly_once(monkeypatch) -> None:
     backend = FakeBackend()
     monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
@@ -99,8 +129,109 @@ async def test_vmvm_runtime_surfaces_transport_failure(monkeypatch) -> None:
         "error_type": "broken_pipe",
         "exit_code": -1,
     }
+    backend.recovery_results = [
+        {
+            "status": "success",
+            "output": "finished once",
+            "error_type": "none",
+            "exit_code": 0,
+        }
+    ]
 
-    with pytest.raises(SandboxError, match="broken_pipe"):
-        await runtime.run(["true"], {})
+    result = await runtime.run(["do-work"], {})
+
+    assert result == vmvm.ProgramResult(exit_code=0, stdout="finished once", stderr="")
+    assert backend.restart_calls == 1
+    assert backend.commands.count(("cd /app && do-work", 10)) == 1
+
+    await runtime.stop()
+
+
+async def test_vmvm_runtime_recovers_across_repeated_transport_drops(monkeypatch) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+    backend.result = {
+        "status": "error",
+        "output": "first drop",
+        "error_type": "broken_pipe",
+        "exit_code": -1,
+    }
+    backend.recovery_results = [
+        {
+            "status": "error",
+            "output": "second drop",
+            "error_type": "broken_pipe",
+            "exit_code": -1,
+        },
+        {
+            "status": "error",
+            "output": "command failed",
+            "error_type": "exit",
+            "exit_code": 7,
+        },
+    ]
+
+    result = await runtime.run(["do-work"], {})
+
+    assert result == vmvm.ProgramResult(exit_code=7, stdout="command failed", stderr="")
+    assert backend.restart_calls == 2
+    assert backend.commands.count(("cd /app && do-work", 10)) == 1
+
+    await runtime.stop()
+
+
+async def test_vmvm_runtime_bounds_repeated_transport_recovery(monkeypatch) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+    dropped: vmvm.VMVMBashResult = {
+        "status": "error",
+        "output": "connection dropped",
+        "error_type": "broken_pipe",
+        "exit_code": -1,
+    }
+    backend.result = dropped
+    backend.recovery_results = [dropped] * vmvm.MAX_TRANSPORT_RECOVERY_ATTEMPTS
+
+    with pytest.raises(SandboxError, match="transport remained unavailable"):
+        await runtime.run(["do-work"], {})
+
+    assert backend.restart_calls == vmvm.MAX_TRANSPORT_RECOVERY_ATTEMPTS
+    assert backend.commands.count(("cd /app && do-work", 10)) == 1
+
+    await runtime.stop()
+
+
+@pytest.mark.parametrize(
+    "restart_result,recovery_result,match",
+    [
+        (False, None, "sandbox state is unavailable"),
+        (True, None, "exact-once execution cannot be proven"),
+    ],
+)
+async def test_vmvm_runtime_rejects_unrecoverable_command(
+    monkeypatch,
+    restart_result: bool,
+    recovery_result: vmvm.VMVMBashResult | None,
+    match: str,
+) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+    backend.result = {
+        "status": "error",
+        "output": "connection dropped",
+        "error_type": "broken_pipe",
+        "exit_code": -1,
+    }
+    backend.restart_result = restart_result
+    backend.recovery_results = [recovery_result]
+
+    with pytest.raises(SandboxError, match=match):
+        await runtime.run(["do-work"], {})
 
     await runtime.stop()
