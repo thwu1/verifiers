@@ -6,15 +6,26 @@ import logging
 import shlex
 from pathlib import PurePosixPath
 from typing import ClassVar, Literal, Protocol, TypedDict
+from urllib.parse import urlsplit
 
 from pydantic import Field
 from pydantic_config import BaseConfig
 
-from verifiers.v1.errors import SandboxError
+from verifiers.v1.errors import SandboxError, TunnelError
 from verifiers.v1.runtimes.base import ProgramResult, Runtime, open_tunnel
 
 logger = logging.getLogger(__name__)
 MAX_TRANSPORT_RECOVERY_ATTEMPTS = 5
+ISOLATED_PROGRAM_ENV = {
+    "HTTP_PROXY": "",
+    "HTTPS_PROXY": "",
+    "ALL_PROXY": "",
+    "http_proxy": "",
+    "https_proxy": "",
+    "all_proxy": "",
+    "NO_PROXY": "*",
+    "no_proxy": "*",
+}
 
 
 class VMVMBashResult(TypedDict):
@@ -157,6 +168,8 @@ class VMVMRuntime(Runtime):
         logger.info("vmvm: container %s up (image=%s)", self._descriptor, self.config.image)
 
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+        if self._network_active:
+            env = {**env, **ISOLATED_PROGRAM_ENV}
         command = shell_command(argv, env, self.config.workdir)
         async with self._run_lock:
             try:
@@ -268,6 +281,42 @@ class VMVMRuntime(Runtime):
         except Exception as error:
             raise SandboxError(f"write {path!r}: {error}") from error
 
+    async def host_endpoint_is_reachable(self, url: str) -> bool:
+        """Check the workload-to-host HTTP path without consulting proxy settings."""
+        endpoint = urlsplit(url)
+        if endpoint.hostname is None or endpoint.port is None:
+            return False
+        python_probe = (
+            "import socket; "
+            f"s=socket.create_connection(({endpoint.hostname!r}, {endpoint.port}), timeout=5); "
+            "s.settimeout(5); "
+            "s.sendall(b'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'); "
+            "data=s.recv(16); s.close(); assert data.startswith(b'HTTP/')"
+        )
+        shell_probe = shlex.quote("printf 'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'")
+        probe_url = shlex.quote(f"http://{endpoint.hostname}:{endpoint.port}/")
+        probe = (
+            "if command -v python3 >/dev/null 2>&1; then "
+            f"exec python3 -c {shlex.quote(python_probe)}; "
+            "elif command -v python >/dev/null 2>&1; then "
+            f"exec python -c {shlex.quote(python_probe)}; "
+            "elif command -v nc >/dev/null 2>&1; then "
+            f"{shell_probe} | nc -w 5 {shlex.quote(endpoint.hostname)} {endpoint.port} | head -c 5 | grep -q '^HTTP/'; "
+            "elif command -v busybox >/dev/null 2>&1; then "
+            f"{shell_probe} | busybox nc -w 5 {shlex.quote(endpoint.hostname)} {endpoint.port} | "
+            "head -c 5 | grep -q '^HTTP/'; "
+            "elif command -v curl >/dev/null 2>&1; then "
+            f"exec curl --noproxy '*' --silent --show-error --connect-timeout 5 --max-time 5 "
+            f"--output /dev/null {probe_url}; "
+            "elif command -v wget >/dev/null 2>&1; then "
+            f"headers=$(wget --no-proxy --server-response --timeout=5 --tries=1 "
+            f"--output-document=/dev/null {probe_url} 2>&1 || true); "
+            "printf '%s\\n' \"$headers\" | grep -q 'HTTP/'; "
+            "else exit 125; fi"
+        )
+        result = await self.run(["sh", "-c", probe], ISOLATED_PROGRAM_ENV)
+        return result.exit_code == 0
+
     @contextlib.asynccontextmanager
     async def host_endpoint(self, port: int):
         async def start() -> tuple[object, str]:
@@ -276,7 +325,18 @@ class VMVMRuntime(Runtime):
         tunnel, url = await open_tunnel(start, f"VMVM host tunnel (port {port})")
         try:
             await self.activate_network_policy()
-            yield url
+            if self._network_active and not await self.host_endpoint_is_reachable(url):
+                raise TunnelError("VMVM host tunnel was unreachable after no-network activation")
+            try:
+                yield url
+            except Exception as body_error:
+                try:
+                    reachable = await self.host_endpoint_is_reachable(url)
+                except Exception:
+                    reachable = False
+                if not reachable:
+                    raise TunnelError("VMVM host tunnel became unreachable during the rollout") from body_error
+                raise
         finally:
             await asyncio.to_thread(self.backend.close_host_tunnel, tunnel)
 

@@ -1,5 +1,5 @@
 import pytest
-from verifiers.v1.errors import SandboxError
+from verifiers.v1.errors import ProviderError, SandboxError, TunnelError
 from verifiers.v1.runtimes import (
     VMVMConfig,
     VMVMRuntime,
@@ -138,10 +138,100 @@ async def test_vmvm_runtime_activates_network_before_deferred_startup_and_progra
     assert result.exit_code == 0
     assert backend.network_prepare_calls == 1
     assert events == ["activate", "startup", "program"]
+    isolated_commands = [command for command, _ in backend.commands if "NO_PROXY=*" in command]
+    assert len(isolated_commands) == 3
+    assert any("socket.create_connection" in command for command in isolated_commands)
+    assert any("curl --noproxy" in command for command in isolated_commands)
+    assert any("wget --no-proxy" in command for command in isolated_commands)
+    assert any("start-service" in command for command in isolated_commands)
+    assert any("run-agent" in command for command in isolated_commands)
+    assert backend.open_tunnels == []
 
     with pytest.raises(SandboxError, match="cannot relax"):
         await runtime.configure_network_policy("public")
 
+    await runtime.stop()
+
+
+async def test_vmvm_runtime_closes_tunnel_when_post_isolation_http_probe_fails(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+
+    def run_bash(command: str, timeout: float = 60.0) -> vmvm.VMVMBashResult:
+        backend.commands.append((command, timeout))
+        if "socket.create_connection" in command:
+            return {
+                "status": "error",
+                "output": "probe failed",
+                "error_type": "exit",
+                "exit_code": 7,
+            }
+        return backend.result
+
+    backend.run_bash = run_bash
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+    await runtime.configure_network_policy("no-network")
+
+    with pytest.raises(TunnelError, match="unreachable after no-network activation"):
+        async with runtime.host_endpoint(4321):
+            pytest.fail("an unreachable isolated tunnel must not be yielded")
+
+    assert backend.network_activate_calls == 1
+    assert backend.open_tunnels == []
+    await runtime.stop()
+
+
+@pytest.mark.parametrize(
+    "body_error",
+    [ProviderError("provider failed"), RuntimeError("harness failed")],
+)
+async def test_vmvm_runtime_preserves_body_error_when_tunnel_remains_reachable(
+    monkeypatch,
+    body_error: Exception,
+) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+
+    with pytest.raises(type(body_error)) as caught:
+        async with runtime.host_endpoint(4321):
+            raise body_error
+
+    assert caught.value is body_error
+    probes = [command for command, _ in backend.commands if "socket.create_connection" in command]
+    assert len(probes) == 1
+    assert "NO_PROXY=*" in probes[0]
+    assert "curl --noproxy" in probes[0]
+    assert "wget --no-proxy" in probes[0]
+    assert backend.open_tunnels == []
+    await runtime.stop()
+
+
+async def test_vmvm_runtime_reclassifies_body_error_when_tunnel_became_unreachable(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+    body_error = ProviderError("provider failed")
+
+    with pytest.raises(TunnelError, match="became unreachable") as caught:
+        async with runtime.host_endpoint(4321):
+            backend.result = {
+                "status": "error",
+                "output": "probe failed",
+                "error_type": "exit",
+                "exit_code": 7,
+            }
+            raise body_error
+
+    assert caught.value.__cause__ is body_error
+    assert backend.open_tunnels == []
     await runtime.stop()
 
 

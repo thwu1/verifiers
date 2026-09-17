@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from aiohttp import web
+from openai import OpenAIError
 from pydantic import TypeAdapter, ValidationError
 from pydantic_core import PydanticSerializationError, from_json, to_json
 
@@ -37,10 +38,14 @@ from verifiers.v1.clients import RolloutContext
 from verifiers.v1.dialects import DIALECTS, Dialect
 from verifiers.v1.dialects.base import is_sse_done_event
 from verifiers.v1.errors import (
+    HarnessError,
+    InterceptionError,
     OverlongPromptError,
+    ProviderError,
     RolloutError,
     TasksetError,
     UserError,
+    model_error,
 )
 from verifiers.v1.trace import Trace
 from verifiers.v1.types import Messages, Response, SamplingConfig
@@ -69,6 +74,19 @@ def _completion_response(completion: dict | None) -> web.Response:
     except PydanticSerializationError:
         return web.json_response(completion)
     return web.Response(body=body, content_type="application/json", charset="utf-8")
+
+
+def _unexpected_model_error(error: Exception) -> ProviderError:
+    """Classify an exception escaping a client call at the provider boundary."""
+    detail: OpenAIError | str = (
+        error if isinstance(error, OpenAIError) else str(error) or type(error).__name__
+    )
+    return model_error(detail)
+
+
+def _stream_provider_error(error: Exception) -> ProviderError:
+    """Keep an already classified provider failure, or classify a stream transport/parser fault."""
+    return error if isinstance(error, ProviderError) else _unexpected_model_error(error)
 
 
 async def _queue_chunks(
@@ -100,11 +118,20 @@ class RolloutLimits:
         """The name of the first limit `trace` has reached, or None if within all caps."""
         if self.max_turns is not None and trace.num_turns >= self.max_turns:
             return "max_turns"
-        if self.max_input_tokens is not None and trace.prompt_len >= self.max_input_tokens:
+        if (
+            self.max_input_tokens is not None
+            and trace.prompt_len >= self.max_input_tokens
+        ):
             return "max_input_tokens"
-        if self.max_output_tokens is not None and trace.completion_len >= self.max_output_tokens:
+        if (
+            self.max_output_tokens is not None
+            and trace.completion_len >= self.max_output_tokens
+        ):
             return "max_output_tokens"
-        if self.max_total_tokens is not None and trace.total_tokens >= self.max_total_tokens:
+        if (
+            self.max_total_tokens is not None
+            and trace.total_tokens >= self.max_total_tokens
+        ):
             return "max_total_tokens"
         return None
 
@@ -121,7 +148,10 @@ class RolloutLimits:
         introduced by new prompt messages are not known until the provider returns token IDs,
         so :meth:`response_violation` is the final fail-closed guard before graph commit.
         """
-        if self.max_input_tokens is not None and prompt_prefix_tokens >= self.max_input_tokens:
+        if (
+            self.max_input_tokens is not None
+            and prompt_prefix_tokens >= self.max_input_tokens
+        ):
             return sampling, "max_input_tokens"
 
         remaining: list[tuple[int, str]] = []
@@ -162,9 +192,15 @@ class RolloutLimits:
             return None
         if self.max_input_tokens is not None and prompt_tokens > self.max_input_tokens:
             return "max_input_tokens"
-        if self.max_output_tokens is not None and trace.completion_len + completion_tokens > self.max_output_tokens:
+        if (
+            self.max_output_tokens is not None
+            and trace.completion_len + completion_tokens > self.max_output_tokens
+        ):
             return "max_output_tokens"
-        if self.max_total_tokens is not None and prompt_tokens + completion_tokens > self.max_total_tokens:
+        if (
+            self.max_total_tokens is not None
+            and prompt_tokens + completion_tokens > self.max_total_tokens
+        ):
             return "max_total_tokens"
         return None
 
@@ -214,7 +250,9 @@ class RolloutSession:
                 return stop.__name__
         return None
 
-    def sampling_for(self, *, prompt_prefix_tokens: int) -> tuple[SamplingConfig, str | None]:
+    def sampling_for(
+        self, *, prompt_prefix_tokens: int
+    ) -> tuple[SamplingConfig, str | None]:
         """Return this turn's bounded sampling config, or stop before an empty-budget call."""
         sampling, limit = self.limits.constrain_sampling(
             self.trace,
@@ -265,13 +303,39 @@ class InterceptionServer:
         selects the wire format (see `dialects.DIALECTS`)."""
 
         async def handler(request: web.Request) -> web.StreamResponse:
-            return await self.handle_request(request, dialect)
+            try:
+                return await self.handle_request(request, dialect)
+            except Exception as e:
+                session = self.sessions.get(dialect.secret(request.headers))
+                if session is None:
+                    raise
+                error = (
+                    e
+                    if isinstance(e, RolloutError)
+                    else InterceptionError(
+                        f"interception request failed: {type(e).__name__}: {e}"
+                    )
+                )
+                return self._fail(session, dialect, error, preserve=True)
 
         return handler
 
     def _aux_handler_for(self, dialect: Dialect, route: str):
         async def handler(request: web.Request) -> web.Response:
-            return await self.handle_aux(request, dialect, route)
+            try:
+                return await self.handle_aux(request, dialect, route)
+            except Exception as e:
+                session = self.sessions.get(dialect.secret(request.headers))
+                if session is None:
+                    raise
+                error = (
+                    e
+                    if isinstance(e, RolloutError)
+                    else InterceptionError(
+                        f"interception auxiliary request failed: {type(e).__name__}: {e}"
+                    )
+                )
+                return self._fail(session, dialect, error, preserve=True)
 
         return handler
 
@@ -302,42 +366,89 @@ class InterceptionServer:
         if self.runner is not None:
             await self.runner.cleanup()
 
-    def _fail(self, session: RolloutSession, dialect: Dialect, error: RolloutError) -> web.Response:
+    def _fail(
+        self,
+        session: RolloutSession,
+        dialect: Dialect,
+        error: RolloutError,
+        *,
+        status: int | None = None,
+        preserve: bool = False,
+    ) -> web.Response:
         """Stash a model-turn-adjacent failure (a `@stop` or user simulator raising) so the rollout
-        re-raises it as the real cause, and report it to the harness as an HTTP error."""
-        session.error = error
-        logger.warning("rollout %s failed: %s: %s", session.trace.id, type(error).__name__, error)
+        re-raises it as the real cause, and report it to the harness as an HTTP error. ``status``
+        distinguishes malformed harness requests (400) from transient failures; ``preserve`` keeps
+        an earlier, more relevant turn failure while still returning the current error response."""
+        if not preserve or session.error is None:
+            session.error = error
+        logger.warning(
+            "rollout %s failed: %s: %s", session.trace.id, type(error).__name__, error
+        )
         return web.json_response(
             dialect.error_body(str(error)),
-            status=getattr(error, "status_code", 502),
+            status=status if status is not None else getattr(error, "status_code", 502),
         )
 
-    async def handle_request(self, request: web.Request, dialect: Dialect) -> web.StreamResponse:
+    async def handle_request(
+        self, request: web.Request, dialect: Dialect
+    ) -> web.StreamResponse:
         session = self.sessions.get(dialect.secret(request.headers))
         if session is None:
             logger.warning("interception: unauthorized request")
             return web.json_response(dialect.error_body("unauthorized"), status=401)
-        raw = await request.read()
         try:
-            body = from_json(raw)
-        except ValueError:
-            body = json.loads(raw)
-        # Keep `read()` for aiohttp's size guard, then release its cache and our local
-        # alias after parsing so the wire body does not survive model inference.
-        request._read_bytes = None
-        del raw
+            raw = await request.read()
+        except web.HTTPRequestEntityTooLarge as e:
+            return self._fail(
+                session,
+                dialect,
+                HarnessError(f"harness model request body too large: {e}"),
+                status=413,
+            )
+        except RolloutError as e:
+            return self._fail(session, dialect, e)
+        except Exception as e:
+            return self._fail(
+                session,
+                dialect,
+                InterceptionError(
+                    f"reading harness request failed: {type(e).__name__}: {e}"
+                ),
+            )
+        try:
+            try:
+                body = from_json(raw)
+            except ValueError:
+                body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise TypeError("request body must be a JSON object")
+            prompt, _ = dialect.parse_request(body)
+            streaming = dialect.streaming(body)
+        except RolloutError as e:
+            return self._fail(session, dialect, e)
+        except Exception as e:
+            return self._fail(
+                session,
+                dialect,
+                HarnessError(f"invalid harness model request: {type(e).__name__}: {e}"),
+                status=400,
+            )
+        finally:
+            # Keep `read()` for aiohttp's size guard, then release its cache and our local
+            # alias after parsing so the wire body does not survive model inference.
+            request._read_bytes = None
+            del raw
         logger.debug(
             "intercept %s: id=%s stream=%s",
             request.path,
             session.trace.id,
-            dialect.streaming(body),
+            streaming,
         )
         # `body` is forwarded to the model 1:1 (the proxy mutates only model + sampling), so no
         # provider field is lost. `prompt` is the dialect's typed parse, kept only to build the
         # trace (the renderer re-derives its own from the body it's handed). A user simulator
         # extends both each turn (`dialect.extend` for the wire, `prompt` for the trace).
         prompt: Messages
-        prompt, _ = dialect.parse_request(body)
         # A task with no prompt has its conversation opened by the user simulator: before the
         # first model call, seed the simulator's opening user turn(s) into both the wire request
         # and the trace prompt, so the model answers the user rather than an empty prompt. Guarded
@@ -346,21 +457,47 @@ class InterceptionServer:
         # retried opening request (e.g. the harness SDK retrying a transient model 502, before any
         # turn is recorded) doesn't advance the simulator's queue and skip the opening turn. The
         # post-turn loop below then drives the remaining turns as usual.
-        if session.user is not None and session.trace.task.prompt is None and session.trace.num_turns == 0:
+        if (
+            session.user is not None
+            and session.trace.task.prompt is None
+            and session.trace.num_turns == 0
+        ):
             if session.opening is None:
-                session.opening = await session.user("")
-            body = dialect.extend(body, None, session.opening)
+                try:
+                    session.opening = await session.user("")
+                except RolloutError as e:
+                    return self._fail(session, dialect, e)
+                except Exception as e:
+                    return self._fail(
+                        session,
+                        dialect,
+                        UserError(f"user simulator failed: {type(e).__name__}: {e}"),
+                    )
+            try:
+                body = dialect.extend(body, None, session.opening)
+            except RolloutError as e:
+                return self._fail(session, dialect, e)
+            except Exception as e:
+                return self._fail(
+                    session,
+                    dialect,
+                    InterceptionError(
+                        f"extending model request failed: {type(e).__name__}: {e}"
+                    ),
+                )
             prompt = [*prompt, *session.opening]
             # If the simulator ended at the open (its taskset's `@stop` now fires), the loop's
             # `refused()` below halts the harness before any model call — no special-casing here.
-        if dialect.streaming(body):
+        if streaming:
             return await self._stream(request, session, dialect, body, prompt)
         headers = request.headers.copy()
         # A user simulator turns one program request into a multi-turn exchange: after each
         # model turn the simulator's reply is injected as a user turn and the model is
         # re-prompted, so a whole game plays out here and only the final assistant message
         # returns to the (simulator-unaware) program. Without a simulator the loop runs once.
-        completion: dict | None = None  # the latest turn's response, returned to the program
+        completion: dict | None = (
+            None  # the latest turn's response, returned to the program
+        )
         while True:
             try:
                 refused = await session.refused()
@@ -376,15 +513,30 @@ class InterceptionServer:
                 # Refuse the first model call to halt the harness; once a simulated
                 # conversation is under way, just end it and return the last turn cleanly.
                 if completion is None:
-                    return web.json_response(dialect.error_body(f"rollout stopped: {refused}"), status=400)
+                    return web.json_response(
+                        dialect.error_body(f"rollout stopped: {refused}"), status=400
+                    )
                 return _completion_response(completion)
-            turn = graph.prepare_turn(session.trace, prompt)
-            sampling, refused = session.sampling_for(
-                prompt_prefix_tokens=turn.accounted_path_len
-            )
+            try:
+                turn = graph.prepare_turn(session.trace, prompt)
+                sampling, refused = session.sampling_for(
+                    prompt_prefix_tokens=turn.accounted_path_len
+                )
+            except RolloutError as e:
+                return self._fail(session, dialect, e)
+            except Exception as e:
+                return self._fail(
+                    session,
+                    dialect,
+                    InterceptionError(
+                        f"preparing model turn failed: {type(e).__name__}: {e}"
+                    ),
+                )
             if refused is not None:
                 if completion is None:
-                    return web.json_response(dialect.error_body(f"rollout stopped: {refused}"), status=400)
+                    return web.json_response(
+                        dialect.error_body(f"rollout stopped: {refused}"), status=400
+                    )
                 return _completion_response(completion)
             session.error = None
             try:
@@ -419,22 +571,32 @@ class InterceptionServer:
                     type(e).__name__,
                     e,
                 )
-                return web.json_response(dialect.error_body(str(e)), status=getattr(e, "status_code", 502))
-            except Exception as e:  # surface to the program as an API error
-                logger.warning(
-                    "model call failed: id=%s %s: %s",
-                    session.trace.id,
-                    type(e).__name__,
-                    e,
+                return web.json_response(
+                    dialect.error_body(str(e)), status=getattr(e, "status_code", 502)
                 )
-                return web.json_response(dialect.error_body(str(e)), status=502)
+            except Exception as e:  # an unexpected client/response-parser failure
+                return self._fail(session, dialect, _unexpected_model_error(e))
             # `Response.raw` is the wire response handed to the program 1:1 — the provider's
             # verbatim bytes (proxy) or the client's serialized completion (renderer).
-            if (refused := session.commit(turn, response)) is not None:
+            try:
+                refused = session.commit(turn, response)
+            except RolloutError as e:
+                return self._fail(session, dialect, e)
+            except Exception as e:
+                return self._fail(
+                    session,
+                    dialect,
+                    InterceptionError(
+                        f"committing model turn failed: {type(e).__name__}: {e}"
+                    ),
+                )
+            if refused is not None:
                 # The provider returned more than its requested allowance, or a newly added
                 # prompt made the exact branch too large. Do not persist that oversized turn.
                 if completion is None:
-                    return web.json_response(dialect.error_body(f"rollout stopped: {refused}"), status=400)
+                    return web.json_response(
+                        dialect.error_body(f"rollout stopped: {refused}"), status=400
+                    )
                 return _completion_response(completion)
             completion = response.raw
             logger.debug(
@@ -486,17 +648,34 @@ class InterceptionServer:
         except RolloutError as e:
             return self._fail(session, dialect, e)
         except Exception as e:
-            return self._fail(session, dialect, TasksetError(f"@stop failed: {type(e).__name__}: {e}"))
+            return self._fail(
+                session, dialect, TasksetError(f"@stop failed: {type(e).__name__}: {e}")
+            )
         if refused is not None:
-            return web.json_response(dialect.error_body(f"rollout stopped: {refused}"), status=400)
+            return web.json_response(
+                dialect.error_body(f"rollout stopped: {refused}"), status=400
+            )
         session.error = None
         try:
             turn = graph.prepare_turn(session.trace, prompt)
             sampling, refused = session.sampling_for(
                 prompt_prefix_tokens=turn.accounted_path_len
             )
+        except RolloutError as e:
+            return self._fail(session, dialect, e)
+        except Exception as e:
+            return self._fail(
+                session,
+                dialect,
+                InterceptionError(
+                    f"preparing streamed model turn failed: {type(e).__name__}: {e}"
+                ),
+            )
+        try:
             if refused is not None:
-                return web.json_response(dialect.error_body(f"rollout stopped: {refused}"), status=400)
+                return web.json_response(
+                    dialect.error_body(f"rollout stopped: {refused}"), status=400
+                )
             reply = await session.ctx.client.relay(
                 dialect,
                 body,
@@ -508,7 +687,9 @@ class InterceptionServer:
         except OverlongPromptError:
             session.trace.stop("context_length")
             logger.debug("prompt too long: id=%s", session.trace.id)
-            return web.json_response(dialect.error_body("rollout stopped: context_length"), status=400)
+            return web.json_response(
+                dialect.error_body("rollout stopped: context_length"), status=400
+            )
         except RolloutError as e:
             session.error = e
             logger.warning(
@@ -517,21 +698,28 @@ class InterceptionServer:
                 type(e).__name__,
                 e,
             )
-            return web.json_response(dialect.error_body(str(e)), status=getattr(e, "status_code", 502))
-        except Exception as e:  # surface to the program as an API error
-            logger.warning("model call failed: id=%s %s", session.trace.id, e)
-            return web.json_response(dialect.error_body(str(e)), status=502)
-        resp = web.StreamResponse(headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+            return web.json_response(
+                dialect.error_body(str(e)), status=getattr(e, "status_code", 502)
+            )
+        except Exception as e:  # an unexpected client/response-parser failure
+            return self._fail(session, dialect, _unexpected_model_error(e))
+        resp = web.StreamResponse(
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        )
         resp.content_type = reply.content_type.split(";")[0].strip()
         # Parse complete events as they relay, avoiding a full-stream byte copy.
         parser = dialect.stream_parser()
         feed_event = parser.feed
         on_done = parser.on_done
         # One bounded producer avoids per-event tasks; keepalive timeouts only cancel readiness waits.
-        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(
+            maxsize=_STREAM_QUEUE_MAXSIZE
+        )
         ready = asyncio.Event()
         producer = asyncio.create_task(_queue_chunks(reply.chunks, queue, ready))
         parser_error: Exception | None = None
+        relay_error: RolloutError | None = None
+        disconnected = False
         try:
             await resp.prepare(request)
             while True:
@@ -555,15 +743,51 @@ class InterceptionServer:
                         feed_event(chunk)
                     except Exception as e:
                         parser_error = e
-        except ConnectionResetError:
-            return resp
+        except Exception as e:
+            producer_error = None
+            if producer.done() and not producer.cancelled():
+                producer_error = producer.exception()
+            if producer_error is not None:
+                relay_error = _stream_provider_error(producer_error)
+            elif isinstance(e, ConnectionResetError):
+                disconnected = True
+            else:
+                relay_error = InterceptionError(
+                    f"relaying streamed response failed: {type(e).__name__}: {e}"
+                )
         finally:
             producer.cancel()
             # Let a canceled producer enqueue EOF while unwinding.
             if queue.full():
                 queue.get_nowait()
             await asyncio.gather(producer, return_exceptions=True)
-            await reply.close()
+            try:
+                await reply.close()
+            except Exception as e:
+                close_error = _stream_provider_error(e)
+                if relay_error is None and parser_error is None:
+                    relay_error = close_error
+                else:
+                    logger.warning(
+                        "stream close failed after an earlier error: id=%s %s: %s",
+                        session.trace.id,
+                        type(close_error).__name__,
+                        close_error,
+                    )
+
+        if relay_error is not None:
+            session.error = session.error or relay_error
+            logger.warning(
+                "stream model call failed during relay: id=%s %s: %s",
+                session.trace.id,
+                type(relay_error).__name__,
+                relay_error,
+            )
+            with contextlib.suppress(ConnectionResetError):
+                await resp.write_eof()
+            return resp
+        if disconnected and parser_error is None:
+            return resp
 
         try:
             if parser_error is not None:
@@ -571,8 +795,6 @@ class InterceptionServer:
             response = parser.finish()
             if reply.finalize_response is not None:
                 reply.finalize_response(response)
-            if session.commit(turn, response) is None:
-                logger.debug("intercept stream turn: id=%s", session.trace.id)
         except RolloutError as e:
             # The SSE status/body have already reached the harness, so an error cannot be relayed
             # now. Preserve it on the session for Rollout to raise after the harness returns.
@@ -583,12 +805,46 @@ class InterceptionServer:
                 type(e).__name__,
                 e,
             )
+        except Exception as e:
+            session.error = _unexpected_model_error(e)
+            logger.warning(
+                "stream model call failed after relay: id=%s %s: %s",
+                session.trace.id,
+                type(session.error).__name__,
+                session.error,
+            )
+        else:
+            try:
+                committed = session.commit(turn, response)
+            except RolloutError as e:
+                session.error = e
+                logger.warning(
+                    "stream model call failed after relay: id=%s %s: %s",
+                    session.trace.id,
+                    type(e).__name__,
+                    e,
+                )
+            except Exception as e:
+                session.error = InterceptionError(
+                    f"committing streamed model turn failed: {type(e).__name__}: {e}"
+                )
+                logger.warning(
+                    "stream model call failed after relay: id=%s %s: %s",
+                    session.trace.id,
+                    type(session.error).__name__,
+                    session.error,
+                )
+            else:
+                if committed is None:
+                    logger.debug("intercept stream turn: id=%s", session.trace.id)
         finally:
             with contextlib.suppress(ConnectionResetError):
                 await resp.write_eof()
         return resp
 
-    async def handle_aux(self, request: web.Request, dialect: Dialect, route: str) -> web.Response:
+    async def handle_aux(
+        self, request: web.Request, dialect: Dialect, route: str
+    ) -> web.Response:
         """A non-model-turn side request (an `aux_route`, e.g. Anthropic's `count_tokens`):
         relayed verbatim to the provider, never recorded on the trace."""
         session = self.sessions.get(dialect.secret(request.headers))
@@ -596,7 +852,50 @@ class InterceptionServer:
             return web.json_response(dialect.error_body("unauthorized"), status=401)
         logger.debug("intercept aux %s: id=%s", route, session.trace.id)
         try:
-            result = await session.ctx.client.relay_aux(dialect, route, await request.json())
+            raw = await request.read()
+        except web.HTTPRequestEntityTooLarge as e:
+            return self._fail(
+                session,
+                dialect,
+                HarnessError(f"harness auxiliary request body too large: {e}"),
+                status=413,
+                preserve=True,
+            )
+        except RolloutError as e:
+            return self._fail(session, dialect, e, preserve=True)
+        except Exception as e:
+            return self._fail(
+                session,
+                dialect,
+                InterceptionError(
+                    f"reading harness auxiliary request failed: {type(e).__name__}: {e}"
+                ),
+                preserve=True,
+            )
+        try:
+            try:
+                body = from_json(raw)
+            except ValueError:
+                body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise TypeError("request body must be a JSON object")
+        except RolloutError as e:
+            return self._fail(session, dialect, e, preserve=True)
+        except Exception as e:
+            return self._fail(
+                session,
+                dialect,
+                HarnessError(
+                    f"invalid harness auxiliary request: {type(e).__name__}: {e}"
+                ),
+                status=400,
+                preserve=True,
+            )
+        finally:
+            request._read_bytes = None
+            del raw
+        try:
+            result = await session.ctx.client.relay_aux(dialect, route, body)
         except RolloutError as e:
             # An aux call isn't a model turn, so don't clobber a pending turn error.
             session.error = session.error or e
@@ -606,10 +905,13 @@ class InterceptionServer:
                 type(e).__name__,
                 e,
             )
-            return web.json_response(dialect.error_body(str(e)), status=getattr(e, "status_code", 502))
+            return web.json_response(
+                dialect.error_body(str(e)), status=getattr(e, "status_code", 502)
+            )
         except Exception as e:
-            logger.warning("aux call failed: id=%s %s", session.trace.id, e)
-            return web.json_response(dialect.error_body(str(e)), status=502)
+            return self._fail(
+                session, dialect, _unexpected_model_error(e), preserve=True
+            )
         return web.json_response(result)
 
     def _session_for(self, request: web.Request) -> RolloutSession | None:
