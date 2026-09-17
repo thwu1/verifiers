@@ -84,6 +84,11 @@ def _unexpected_model_error(error: Exception) -> ProviderError:
     return model_error(detail)
 
 
+def _stream_provider_error(error: Exception) -> ProviderError:
+    """Keep an already classified provider failure, or classify a stream transport/parser fault."""
+    return error if isinstance(error, ProviderError) else _unexpected_model_error(error)
+
+
 async def _queue_chunks(
     chunks: AsyncIterator[bytes],
     queue: asyncio.Queue[bytes | None],
@@ -393,6 +398,13 @@ class InterceptionServer:
             return web.json_response(dialect.error_body("unauthorized"), status=401)
         try:
             raw = await request.read()
+        except web.HTTPRequestEntityTooLarge as e:
+            return self._fail(
+                session,
+                dialect,
+                HarnessError(f"harness model request body too large: {e}"),
+                status=413,
+            )
         except RolloutError as e:
             return self._fail(session, dialect, e)
         except Exception as e:
@@ -408,6 +420,8 @@ class InterceptionServer:
                 body = from_json(raw)
             except ValueError:
                 body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise TypeError("request body must be a JSON object")
             prompt, _ = dialect.parse_request(body)
             streaming = dialect.streaming(body)
         except RolloutError as e:
@@ -704,6 +718,8 @@ class InterceptionServer:
         ready = asyncio.Event()
         producer = asyncio.create_task(_queue_chunks(reply.chunks, queue, ready))
         parser_error: Exception | None = None
+        relay_error: RolloutError | None = None
+        disconnected = False
         try:
             await resp.prepare(request)
             while True:
@@ -727,15 +743,51 @@ class InterceptionServer:
                         feed_event(chunk)
                     except Exception as e:
                         parser_error = e
-        except ConnectionResetError:
-            return resp
+        except Exception as e:
+            producer_error = None
+            if producer.done() and not producer.cancelled():
+                producer_error = producer.exception()
+            if producer_error is not None:
+                relay_error = _stream_provider_error(producer_error)
+            elif isinstance(e, ConnectionResetError):
+                disconnected = True
+            else:
+                relay_error = InterceptionError(
+                    f"relaying streamed response failed: {type(e).__name__}: {e}"
+                )
         finally:
             producer.cancel()
             # Let a canceled producer enqueue EOF while unwinding.
             if queue.full():
                 queue.get_nowait()
             await asyncio.gather(producer, return_exceptions=True)
-            await reply.close()
+            try:
+                await reply.close()
+            except Exception as e:
+                close_error = _stream_provider_error(e)
+                if relay_error is None and parser_error is None:
+                    relay_error = close_error
+                else:
+                    logger.warning(
+                        "stream close failed after an earlier error: id=%s %s: %s",
+                        session.trace.id,
+                        type(close_error).__name__,
+                        close_error,
+                    )
+
+        if relay_error is not None:
+            session.error = session.error or relay_error
+            logger.warning(
+                "stream model call failed during relay: id=%s %s: %s",
+                session.trace.id,
+                type(relay_error).__name__,
+                relay_error,
+            )
+            with contextlib.suppress(ConnectionResetError):
+                await resp.write_eof()
+            return resp
+        if disconnected and parser_error is None:
+            return resp
 
         try:
             if parser_error is not None:
@@ -800,9 +852,35 @@ class InterceptionServer:
             return web.json_response(dialect.error_body("unauthorized"), status=401)
         logger.debug("intercept aux %s: id=%s", route, session.trace.id)
         try:
-            body = await request.json()
+            raw = await request.read()
+        except web.HTTPRequestEntityTooLarge as e:
+            return self._fail(
+                session,
+                dialect,
+                HarnessError(f"harness auxiliary request body too large: {e}"),
+                status=413,
+                preserve=True,
+            )
         except RolloutError as e:
-            return self._fail(session, dialect, e)
+            return self._fail(session, dialect, e, preserve=True)
+        except Exception as e:
+            return self._fail(
+                session,
+                dialect,
+                InterceptionError(
+                    f"reading harness auxiliary request failed: {type(e).__name__}: {e}"
+                ),
+                preserve=True,
+            )
+        try:
+            try:
+                body = from_json(raw)
+            except ValueError:
+                body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise TypeError("request body must be a JSON object")
+        except RolloutError as e:
+            return self._fail(session, dialect, e, preserve=True)
         except Exception as e:
             return self._fail(
                 session,
@@ -813,6 +891,9 @@ class InterceptionServer:
                 status=400,
                 preserve=True,
             )
+        finally:
+            request._read_bytes = None
+            del raw
         try:
             result = await session.ctx.client.relay_aux(dialect, route, body)
         except RolloutError as e:

@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from aiohttp import web
 
 from verifiers.v1 import graph
 from verifiers.v1.clients import RolloutContext
@@ -34,6 +35,11 @@ class Request:
 
     async def json(self) -> dict:
         return json.loads(await self.read())
+
+
+class OversizedRequest(Request):
+    async def read(self) -> bytes:
+        raise web.HTTPRequestEntityTooLarge(max_size=1, actual_size=2)
 
 
 class Dialect:
@@ -140,6 +146,40 @@ async def test_request_transport_failure_is_stored_as_interception_error():
     assert _response_error(response).startswith(
         "reading harness request failed: RuntimeError:"
     )
+
+
+@pytest.mark.asyncio
+async def test_oversized_model_request_is_stored_as_harness_error_with_413():
+    server, session = _server_and_session(UnusedClient())
+
+    response = await server.handle_request(OversizedRequest(), Dialect())
+
+    assert response.status == 413
+    assert isinstance(session.error, HarnessError)
+    assert _response_error(response).startswith("harness model request body too large:")
+    session.trace.capture_error(session.error)
+    retry = RolloutRetryConfig(
+        max_retries=2,
+        include=[
+            "ProviderError",
+            "SandboxError",
+            "TunnelError",
+            "InterceptionError",
+        ],
+    )
+    assert should_retry(session.trace, retry) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"[]", b'"text"', b"null"])
+async def test_non_object_model_json_is_stored_as_harness_error(body: bytes):
+    server, session = _server_and_session(UnusedClient())
+
+    response = await server.handle_request(Request(body), Dialect())
+
+    assert response.status == 400
+    assert isinstance(session.error, HarnessError)
+    assert "request body must be a JSON object" in _response_error(response)
 
 
 @pytest.mark.asyncio
@@ -283,6 +323,37 @@ class FinalizeFailingClient:
         )
 
 
+class IteratorFailingClient:
+    async def relay(self, *args, **kwargs):
+        async def chunks():
+            yield b'data: {"chunk":true}\n\n'
+            raise RuntimeError("provider stream iteration failed")
+
+        async def close():
+            pass
+
+        return RelayReply(
+            content_type="text/event-stream",
+            chunks=chunks(),
+            close=close,
+        )
+
+
+class CloseFailingClient:
+    async def relay(self, *args, **kwargs):
+        async def chunks():
+            yield b'data: {"chunk":true}\n\n'
+
+        async def close():
+            raise RuntimeError("provider stream close failed")
+
+        return RelayReply(
+            content_type="text/event-stream",
+            chunks=chunks(),
+            close=close,
+        )
+
+
 @pytest.mark.asyncio
 async def test_stream_finalize_failure_is_stored_as_provider_error(monkeypatch):
     monkeypatch.setattr(
@@ -300,6 +371,44 @@ async def test_stream_finalize_failure_is_stored_as_provider_error(monkeypatch):
 
     assert isinstance(session.error, ProviderError)
     assert str(session.error) == "provider response validation failed"
+
+
+@pytest.mark.asyncio
+async def test_stream_iterator_failure_is_stored_as_provider_error(monkeypatch):
+    monkeypatch.setattr(
+        "verifiers.v1.interception.server.web.StreamResponse", StreamResponse
+    )
+    server, session = _server_and_session(IteratorFailingClient())
+
+    await server._stream(
+        Request(),
+        session,
+        StreamDialect(),
+        {},
+        [UserMessage(content="test")],
+    )
+
+    assert isinstance(session.error, ProviderError)
+    assert str(session.error) == "provider stream iteration failed"
+
+
+@pytest.mark.asyncio
+async def test_stream_close_failure_is_stored_as_provider_error(monkeypatch):
+    monkeypatch.setattr(
+        "verifiers.v1.interception.server.web.StreamResponse", StreamResponse
+    )
+    server, session = _server_and_session(CloseFailingClient())
+
+    await server._stream(
+        Request(),
+        session,
+        StreamDialect(),
+        {},
+        [UserMessage(content="test")],
+    )
+
+    assert isinstance(session.error, ProviderError)
+    assert str(session.error) == "provider stream close failed"
 
 
 @pytest.mark.asyncio
@@ -362,6 +471,59 @@ async def test_malformed_aux_json_is_stored_as_harness_error():
 
     assert response.status == 400
     assert isinstance(session.error, HarnessError)
+
+
+@pytest.mark.asyncio
+async def test_aux_transport_failure_is_stored_as_interception_error():
+    server, session = _server_and_session(UnusedClient())
+
+    response = await server.handle_aux(
+        Request(fail_read=True), Dialect(), "/v1/count_tokens"
+    )
+
+    assert response.status == 502
+    assert isinstance(session.error, InterceptionError)
+    assert _response_error(response).startswith(
+        "reading harness auxiliary request failed: RuntimeError:"
+    )
+    session.trace.capture_error(session.error)
+    retry = RolloutRetryConfig(
+        max_retries=2,
+        include=[
+            "ProviderError",
+            "SandboxError",
+            "TunnelError",
+            "InterceptionError",
+        ],
+    )
+    assert should_retry(session.trace, retry) is True
+
+
+@pytest.mark.asyncio
+async def test_oversized_aux_request_is_stored_as_harness_error_with_413():
+    server, session = _server_and_session(UnusedClient())
+
+    response = await server.handle_aux(
+        OversizedRequest(), Dialect(), "/v1/count_tokens"
+    )
+
+    assert response.status == 413
+    assert isinstance(session.error, HarnessError)
+    assert _response_error(response).startswith(
+        "harness auxiliary request body too large:"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"[]", b'"text"', b"null"])
+async def test_non_object_aux_json_is_stored_as_harness_error(body: bytes):
+    server, session = _server_and_session(UnusedClient())
+
+    response = await server.handle_aux(Request(body), Dialect(), "/v1/count_tokens")
+
+    assert response.status == 400
+    assert isinstance(session.error, HarnessError)
+    assert "request body must be a JSON object" in _response_error(response)
 
 
 @pytest.mark.asyncio
