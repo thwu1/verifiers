@@ -1,9 +1,13 @@
 """Remote VMVM runtime backed by a vacli-leased container."""
 
 import asyncio
+import atexit
+import concurrent.futures
 import contextlib
 import logging
+import os
 import shlex
+import threading
 from pathlib import PurePosixPath
 from typing import ClassVar, Literal, Protocol, TypedDict
 from urllib.parse import urlsplit
@@ -16,6 +20,7 @@ from verifiers.v1.runtimes.base import ProgramResult, Runtime, open_tunnel
 
 logger = logging.getLogger(__name__)
 MAX_TRANSPORT_RECOVERY_ATTEMPTS = 5
+MAX_BACKEND_INIT_WORKERS = min(32, (os.cpu_count() or 1) + 4)
 ISOLATED_PROGRAM_ENV = {
     "HTTP_PROXY": "",
     "HTTPS_PROXY": "",
@@ -26,6 +31,56 @@ ISOLATED_PROGRAM_ENV = {
     "NO_PROXY": "*",
     "no_proxy": "*",
 }
+
+_backend_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_backend_init_executor_pid: int | None = None
+_backend_init_lock = threading.Lock()
+_pending_backend_cleanups: set[asyncio.Task[None]] = set()
+
+
+def _get_backend_init_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return the lazy process-local pool used only for blocking VMVM setup."""
+    global _backend_init_executor, _backend_init_executor_pid
+    process_id = os.getpid()
+    with _backend_init_lock:
+        if _backend_init_executor is None or _backend_init_executor_pid != process_id:
+            # An executor inherited across fork has no live worker threads in the
+            # child.  Drop the inherited object without touching its locks and
+            # create a process-local pool on first use.
+            _backend_init_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=MAX_BACKEND_INIT_WORKERS,
+                thread_name_prefix="vmvm-backend-init",
+            )
+            _backend_init_executor_pid = process_id
+        return _backend_init_executor
+
+
+def _shutdown_backend_init_executor() -> None:
+    """Idempotently stop the current process's lazy setup pool."""
+    global _backend_init_executor, _backend_init_executor_pid
+    process_id = os.getpid()
+    with _backend_init_lock:
+        executor = _backend_init_executor
+        owner = _backend_init_executor_pid
+        _backend_init_executor = None
+        _backend_init_executor_pid = None
+    if executor is not None and owner == process_id:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _reset_backend_init_executor_after_fork() -> None:
+    """Discard parent-only executor and lock state in a forked child."""
+    global _backend_init_executor, _backend_init_executor_pid, _backend_init_lock
+    global _pending_backend_cleanups
+    _backend_init_executor = None
+    _backend_init_executor_pid = None
+    _backend_init_lock = threading.Lock()
+    _pending_backend_cleanups = set()
+
+
+atexit.register(_shutdown_backend_init_executor)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_backend_init_executor_after_fork)
 
 
 class VMVMBashResult(TypedDict):
@@ -110,6 +165,41 @@ def create_backend(config: VMVMConfig) -> VMVMBackend:
     return VacliVMVMBackend(backend_config)
 
 
+async def _destroy_backend_safely(backend: VMVMBackend) -> None:
+    try:
+        await asyncio.to_thread(backend.destroy)
+    except Exception:
+        logger.exception("vmvm: deferred backend cleanup failed")
+
+
+async def _destroy_backend_when_ready(future: asyncio.Future[VMVMBackend]) -> None:
+    try:
+        backend = await future
+    except asyncio.CancelledError:
+        return
+    except Exception:  # noqa: BLE001 - a failed constructor owns no backend to clean up
+        return
+    await _destroy_backend_safely(backend)
+
+
+async def _destroy_backend_after_probe(
+    probe: asyncio.Task[VMVMBashResult],
+    backend: VMVMBackend,
+) -> None:
+    try:
+        await probe
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 - probe failure must not skip lease cleanup
+        logger.warning("vmvm: initial probe failed during deferred cleanup")
+    await _destroy_backend_safely(backend)
+
+
+def _track_backend_cleanup(task: asyncio.Task[None]) -> None:
+    _pending_backend_cleanups.add(task)
+    task.add_done_callback(_pending_backend_cleanups.discard)
+
+
 def shell_command(argv: list[str], env: dict[str, str], workdir: str) -> str:
     """Render one argv invocation for the backend's persistent Bash session."""
     command = shlex.join(argv)
@@ -148,18 +238,34 @@ class VMVMRuntime(Runtime):
 
     async def start(self) -> None:
         backend: VMVMBackend | None = None
+        init_future: asyncio.Future[VMVMBackend] | None = None
+        probe: asyncio.Task[VMVMBashResult] | None = None
         try:
-            backend = await asyncio.to_thread(create_backend, self.config)
-            result = await asyncio.to_thread(
-                backend.run_bash,
-                f"mkdir -p {shlex.quote(self.config.workdir)}",
-                self.config.session_timeout,
+            init_future = asyncio.wrap_future(
+                _get_backend_init_executor().submit(create_backend, self.config)
             )
+            backend = await asyncio.shield(init_future)
+            probe = asyncio.create_task(
+                asyncio.to_thread(
+                    backend.run_bash,
+                    f"mkdir -p {shlex.quote(self.config.workdir)}",
+                    self.config.session_timeout,
+                )
+            )
+            result = await asyncio.shield(probe)
             if result["exit_code"] != 0:
                 raise RuntimeError(result["output"])
+        except asyncio.CancelledError:
+            if backend is None and init_future is not None:
+                _track_backend_cleanup(asyncio.create_task(_destroy_backend_when_ready(init_future)))
+            elif backend is not None and probe is not None:
+                _track_backend_cleanup(asyncio.create_task(_destroy_backend_after_probe(probe, backend)))
+            elif backend is not None:
+                _track_backend_cleanup(asyncio.create_task(_destroy_backend_safely(backend)))
+            raise
         except Exception as error:
             if backend is not None:
-                await asyncio.to_thread(backend.destroy)
+                await _destroy_backend_safely(backend)
             raise SandboxError(f"VMVM provisioning failed: {error}") from error
         self._backend = backend
         info = backend.get_debugging_info()
@@ -332,7 +438,7 @@ class VMVMRuntime(Runtime):
             except Exception as body_error:
                 try:
                     reachable = await self.host_endpoint_is_reachable(url)
-                except Exception:
+                except Exception:  # noqa: BLE001 - any probe failure means the tunnel is unavailable
                     reachable = False
                 if not reachable:
                     raise TunnelError("VMVM host tunnel became unreachable during the rollout") from body_error

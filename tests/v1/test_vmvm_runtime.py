@@ -1,4 +1,9 @@
+import asyncio
+import concurrent.futures
+import threading
+
 import pytest
+
 from verifiers.v1.errors import ProviderError, SandboxError, TunnelError
 from verifiers.v1.runtimes import (
     VMVMConfig,
@@ -16,6 +21,7 @@ class FakeBackend:
         self.files: dict[str, bytes] = {}
         self.open_tunnels: list[object] = []
         self.destroyed = False
+        self.destroy_calls = 0
         self.restart_calls = 0
         self.restart_result = True
         self.network_prepare_calls = 0
@@ -61,6 +67,7 @@ class FakeBackend:
 
     def destroy(self) -> None:
         self.destroyed = True
+        self.destroy_calls += 1
 
     def get_debugging_info(self) -> dict[str, object]:
         return {"container_id": "abc123"}
@@ -104,6 +111,241 @@ async def test_vmvm_runtime_lifecycle(monkeypatch) -> None:
 
     await runtime.stop()
     assert backend.destroyed is True
+
+
+async def test_vmvm_backend_init_pool_does_not_starve_default_executor(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+    default_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="vmvm-default-test",
+    )
+    init_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="vmvm-init-test",
+    )
+    loop.set_default_executor(default_executor)
+    first_backend = FakeBackend()
+    second_backend = FakeBackend()
+    first_constructor_entered = threading.Event()
+    second_constructor_entered = threading.Event()
+    release_second_constructor = threading.Event()
+    first_probe_ran = threading.Event()
+    constructor_threads: list[str] = []
+    probe_threads: list[str] = []
+
+    def create(config: VMVMConfig) -> FakeBackend:
+        constructor_threads.append(threading.current_thread().name)
+        if config.image == "first-image":
+            first_constructor_entered.set()
+            assert second_constructor_entered.wait(2)
+            return first_backend
+        second_constructor_entered.set()
+        assert release_second_constructor.wait(5)
+        return second_backend
+
+    def first_run_bash(command: str, timeout: float = 60.0) -> vmvm.VMVMBashResult:
+        probe_threads.append(threading.current_thread().name)
+        first_probe_ran.set()
+        return FakeBackend.run_bash(first_backend, command, timeout)
+
+    first_backend.run_bash = first_run_bash
+    monkeypatch.setattr(vmvm, "create_backend", create)
+    monkeypatch.setattr(vmvm, "_get_backend_init_executor", lambda: init_executor)
+    first = VMVMRuntime(VMVMConfig(image="first-image"))
+    second = VMVMRuntime(VMVMConfig(image="second-image"))
+    first_start = asyncio.create_task(first.start())
+    second_start = asyncio.create_task(second.start())
+    try:
+        for _ in range(200):
+            if first_constructor_entered.is_set() and second_constructor_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert first_constructor_entered.is_set()
+        assert second_constructor_entered.is_set()
+        await asyncio.wait_for(asyncio.shield(first_start), timeout=2)
+        assert first_probe_ran.is_set()
+        assert not second_start.done()
+        assert all(name.startswith("vmvm-init-test") for name in constructor_threads)
+        assert probe_threads and all(name.startswith("vmvm-default-test") for name in probe_threads)
+        release_second_constructor.set()
+        await asyncio.wait_for(second_start, timeout=2)
+        await first.stop()
+        await second.stop()
+    finally:
+        release_second_constructor.set()
+        await asyncio.gather(first_start, second_start, return_exceptions=True)
+        init_executor.shutdown(wait=True, cancel_futures=True)
+
+
+async def test_vmvm_runtime_submits_all_backend_init_to_dedicated_executor(monkeypatch) -> None:
+    class RecordingExecutor(concurrent.futures.Executor):
+        def __init__(self) -> None:
+            self.submitted: list[object] = []
+
+        def submit(self, function, /, *args, **kwargs):
+            self.submitted.append(function)
+            future: concurrent.futures.Future[object] = concurrent.futures.Future()
+            future.set_result(function(*args, **kwargs))
+            return future
+
+    executor = RecordingExecutor()
+    backends: list[FakeBackend] = []
+    default_calls: list[object] = []
+
+    def create(_config: VMVMConfig) -> FakeBackend:
+        backend = FakeBackend()
+        backends.append(backend)
+        return backend
+
+    async def to_thread(function, /, *args, **kwargs):
+        default_calls.append(function)
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(vmvm, "create_backend", create)
+    monkeypatch.setattr(vmvm, "_get_backend_init_executor", lambda: executor)
+    monkeypatch.setattr(vmvm.asyncio, "to_thread", to_thread)
+    runtimes = [VMVMRuntime(VMVMConfig(), name=f"rollout-{index}") for index in range(96)]
+
+    await asyncio.gather(*(runtime.start() for runtime in runtimes))
+
+    assert len(executor.submitted) == 96
+    assert all(function is create for function in executor.submitted)
+    assert len(default_calls) == 96
+    assert all(getattr(function, "__name__", "") == "run_bash" for function in default_calls)
+    assert len(backends) == 96
+
+
+async def test_vmvm_runtime_cancellation_destroys_late_backend(monkeypatch) -> None:
+    init_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    backend = FakeBackend()
+    constructor_entered = threading.Event()
+    release_constructor = threading.Event()
+
+    def create(_config: VMVMConfig) -> FakeBackend:
+        constructor_entered.set()
+        assert release_constructor.wait(5)
+        return backend
+
+    monkeypatch.setattr(vmvm, "create_backend", create)
+    monkeypatch.setattr(vmvm, "_get_backend_init_executor", lambda: init_executor)
+    runtime = VMVMRuntime(VMVMConfig())
+    start = asyncio.create_task(runtime.start())
+    try:
+        for _ in range(200):
+            if constructor_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert constructor_entered.is_set()
+        start.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await start
+        release_constructor.set()
+        for _ in range(200):
+            if backend.destroyed:
+                break
+            await asyncio.sleep(0.01)
+        assert backend.destroy_calls == 1
+        assert not vmvm._pending_backend_cleanups
+    finally:
+        release_constructor.set()
+        init_executor.shutdown(wait=True, cancel_futures=True)
+
+
+async def test_vmvm_runtime_cancellation_waits_for_initial_probe_before_destroy(monkeypatch) -> None:
+    init_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    backend = FakeBackend()
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+
+    def run_bash(command: str, timeout: float = 60.0) -> vmvm.VMVMBashResult:
+        probe_entered.set()
+        assert release_probe.wait(5)
+        return FakeBackend.run_bash(backend, command, timeout)
+
+    backend.run_bash = run_bash
+    monkeypatch.setattr(vmvm, "create_backend", lambda _config: backend)
+    monkeypatch.setattr(vmvm, "_get_backend_init_executor", lambda: init_executor)
+    runtime = VMVMRuntime(VMVMConfig())
+    start = asyncio.create_task(runtime.start())
+    try:
+        for _ in range(200):
+            if probe_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert probe_entered.is_set()
+        start.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await start
+        await asyncio.sleep(0.05)
+        assert backend.destroy_calls == 0
+        release_probe.set()
+        for _ in range(200):
+            if backend.destroyed:
+                break
+            await asyncio.sleep(0.01)
+        assert backend.destroy_calls == 1
+        assert not vmvm._pending_backend_cleanups
+    finally:
+        release_probe.set()
+        init_executor.shutdown(wait=True, cancel_futures=True)
+
+
+async def test_vmvm_runtime_destroys_backend_once_when_initial_probe_fails(monkeypatch) -> None:
+    backend = FakeBackend()
+    backend.result = {
+        "status": "error",
+        "output": "probe failed",
+        "error_type": "exit",
+        "exit_code": 7,
+    }
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(vmvm, "create_backend", lambda _config: backend)
+    monkeypatch.setattr(vmvm, "_get_backend_init_executor", lambda: executor)
+    try:
+        with pytest.raises(SandboxError, match="VMVM provisioning failed"):
+            await VMVMRuntime(VMVMConfig()).start()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    assert backend.destroy_calls == 1
+
+
+async def test_vmvm_runtime_maps_backend_init_failure_without_cleanup(monkeypatch) -> None:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def fail(_config: VMVMConfig) -> FakeBackend:
+        raise RuntimeError("synthetic init failure")
+
+    monkeypatch.setattr(vmvm, "create_backend", fail)
+    monkeypatch.setattr(vmvm, "_get_backend_init_executor", lambda: executor)
+    try:
+        with pytest.raises(SandboxError, match="VMVM provisioning failed"):
+            await VMVMRuntime(VMVMConfig()).start()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    assert not vmvm._pending_backend_cleanups
+
+
+def test_vmvm_backend_init_executor_shutdown_and_fork_reset_are_idempotent(monkeypatch) -> None:
+    monkeypatch.setattr(vmvm, "_backend_init_executor", None)
+    monkeypatch.setattr(vmvm, "_backend_init_executor_pid", None)
+    monkeypatch.setattr(vmvm, "_backend_init_lock", threading.Lock())
+    first = vmvm._get_backend_init_executor()
+
+    assert vmvm._get_backend_init_executor() is first
+    vmvm._shutdown_backend_init_executor()
+    vmvm._shutdown_backend_init_executor()
+    assert vmvm._backend_init_executor is None
+    second = vmvm._get_backend_init_executor()
+    assert second is not first
+
+    vmvm._reset_backend_init_executor_after_fork()
+    third = vmvm._get_backend_init_executor()
+    assert third is not second
+
+    second.shutdown(wait=True, cancel_futures=True)
+    vmvm._shutdown_backend_init_executor()
 
 
 async def test_vmvm_runtime_activates_network_before_deferred_startup_and_program(
