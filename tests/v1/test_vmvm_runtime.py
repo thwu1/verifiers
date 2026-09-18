@@ -326,6 +326,21 @@ async def test_vmvm_runtime_maps_backend_init_failure_without_cleanup(monkeypatc
     assert not vmvm._pending_backend_cleanups
 
 
+async def test_vmvm_deferred_cleanup_log_redacts_backend_error(caplog) -> None:
+    backend = FakeBackend()
+    secret = "opaque_session_auth_and_task_payload"
+
+    def fail_destroy() -> None:
+        raise RuntimeError(secret)
+
+    backend.destroy = fail_destroy
+    with caplog.at_level("WARNING", logger=vmvm.__name__):
+        await vmvm._destroy_backend_safely(backend)
+
+    assert caplog.messages == ["vmvm: deferred backend cleanup failed"]
+    assert secret not in caplog.text
+
+
 def test_vmvm_backend_init_executor_shutdown_and_fork_reset_are_idempotent(monkeypatch) -> None:
     monkeypatch.setattr(vmvm, "_backend_init_executor", None)
     monkeypatch.setattr(vmvm, "_backend_init_executor_pid", None)

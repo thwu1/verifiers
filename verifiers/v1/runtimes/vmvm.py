@@ -169,7 +169,7 @@ async def _destroy_backend_safely(backend: VMVMBackend) -> None:
     try:
         await asyncio.to_thread(backend.destroy)
     except Exception:
-        logger.exception("vmvm: deferred backend cleanup failed")
+        logger.warning("vmvm: deferred backend cleanup failed")
 
 
 async def _destroy_backend_when_ready(future: asyncio.Future[VMVMBackend]) -> None:
