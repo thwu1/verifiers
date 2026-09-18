@@ -241,9 +241,7 @@ class VMVMRuntime(Runtime):
         init_future: asyncio.Future[VMVMBackend] | None = None
         probe: asyncio.Task[VMVMBashResult] | None = None
         try:
-            init_future = asyncio.wrap_future(
-                _get_backend_init_executor().submit(create_backend, self.config)
-            )
+            init_future = asyncio.wrap_future(_get_backend_init_executor().submit(create_backend, self.config))
             backend = await asyncio.shield(init_future)
             probe = asyncio.create_task(
                 asyncio.to_thread(
