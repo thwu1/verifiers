@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 _MAX_REQUEST_BODY = 1024**3  # 1 GiB (aiohttp's default is 1 MiB)
 _KEEPALIVE_INTERVAL_SECONDS = 3
 _STREAM_QUEUE_MAXSIZE = 16
+_SESSION_DRAIN_SECONDS = 30.0
 # The server binds loopback; callers reach it via localhost or a host tunnel (see `reachable_url`).
 _HOST = "127.0.0.1"
 
@@ -232,6 +233,23 @@ class RolloutSession:
     (and may swallow it, or exit non-zero), so the rollout re-raises this original error once the
     harness returns — recording the real `ProviderError` instead of a secondary `HarnessError`.
     Reset before each model turn, so a successful retry clears it."""
+    closed: bool = False
+    """Set before unregistering so a cancellation-resistant handler cannot mutate the trace."""
+
+    def record_error(self, error: "RolloutError", *, preserve: bool = False) -> bool:
+        """Record an admitted request failure only while this session is open."""
+        if self.closed:
+            return False
+        if not preserve or self.error is None:
+            self.error = error
+        return True
+
+    def stop_trace(self, condition: str) -> bool:
+        """Stop the trace only while this session is still admitted."""
+        if self.closed:
+            return False
+        self.trace.stop(condition)
+        return True
 
     async def refused(self) -> str | None:
         """The framework's limits (turns / token budget) and `@stop` checks, run before each
@@ -239,13 +257,16 @@ class RolloutSession:
         call halts the harness (its model call errors out); Harness.run treats it as clean. A taskset
         that ends a trajectory from `trace.state` does it with its own `@stop` (run here generically),
         so the interception server holds no opinion about the state's contents."""
+        if self.closed:
+            raise InterceptionError("rollout session is closed")
         if (limit := self.limits.reached(self.trace)) is not None:
-            self.trace.stop(limit)
+            self.stop_trace(limit)
             logger.debug("limit %r reached: id=%s", limit, self.trace.id)
             return limit
         for stop in self.stops:
             if await stop(self.trace):
-                self.trace.stop(stop.__name__)
+                if not self.stop_trace(stop.__name__):
+                    raise InterceptionError("rollout session is closed")
                 logger.debug("stop %r fired: id=%s", stop.__name__, self.trace.id)
                 return stop.__name__
         return None
@@ -254,21 +275,25 @@ class RolloutSession:
         self, *, prompt_prefix_tokens: int
     ) -> tuple[SamplingConfig, str | None]:
         """Return this turn's bounded sampling config, or stop before an empty-budget call."""
+        if self.closed:
+            raise InterceptionError("rollout session is closed")
         sampling, limit = self.limits.constrain_sampling(
             self.trace,
             self.ctx.sampling,
             prompt_prefix_tokens=prompt_prefix_tokens,
         )
         if limit is not None:
-            self.trace.stop(limit)
+            self.stop_trace(limit)
             logger.debug("limit %r reached: id=%s", limit, self.trace.id)
         return sampling, limit
 
     def commit(self, turn: graph.PendingTurn, response: Response) -> str | None:
         """Commit a response only when its exact/provider-reported sizes fit hard caps."""
+        if self.closed:
+            raise InterceptionError("rollout session is closed")
         limit = self.limits.response_violation(self.trace, response)
         if limit is not None:
-            self.trace.stop(limit)
+            self.stop_trace(limit)
             logger.debug("response crossed limit %r: id=%s", limit, self.trace.id)
             return limit
         turn.commit(response)
@@ -285,6 +310,7 @@ class InterceptionServer:
 
     def __init__(self) -> None:
         self.sessions: dict[str, RolloutSession] = {}
+        self._requests: dict[str, set[asyncio.Task[object]]] = {}
         self.port = 0
         self.runner: web.AppRunner | None = None
 
@@ -293,18 +319,66 @@ class InterceptionServer:
         return it."""
         secret = secrets.token_urlsafe(16)
         self.sessions[secret] = session
+        self._requests[secret] = set()
         return secret
 
-    def unregister(self, secret: str) -> None:
-        self.sessions.pop(secret, None)
+    async def unregister(self, secret: str) -> None:
+        """Close one session and drain every admitted request before returning."""
+        session = self.sessions.pop(secret, None)
+        if session is not None:
+            session.closed = True
+        requests = self._requests.get(secret, set())
+        current = asyncio.current_task()
+        active = tuple(
+            task for task in requests if task is not current and not task.done()
+        )
+        for task in active:
+            task.cancel()
+        if active:
+            _, pending = await asyncio.wait(active, timeout=_SESSION_DRAIN_SECONDS)
+            if pending:
+                raise InterceptionError(
+                    "interception session requests did not drain after cancellation"
+                )
+        self._requests.pop(secret, None)
+
+    async def _tracked_request(
+        self,
+        secret: str,
+        operation: Callable[[], Awaitable[web.StreamResponse]],
+    ) -> web.StreamResponse:
+        task = asyncio.current_task()
+        requests = self._requests.get(secret)
+        if task is not None and requests is not None:
+            requests.add(task)
+        try:
+            return await operation()
+        finally:
+            if task is not None and requests is not None:
+                requests.discard(task)
+
+    def _state_handler_for(
+        self,
+        handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+    ) -> Callable[[web.Request], Awaitable[web.StreamResponse]]:
+        async def tracked(request: web.Request) -> web.StreamResponse:
+            auth = request.headers.get("Authorization", "")
+            secret = auth[len("Bearer ") :] if auth.startswith("Bearer ") else ""
+            return await self._tracked_request(secret, lambda: handler(request))
+
+        return tracked
 
     def _handler_for(self, dialect: Dialect):
         """Bind a route's dialect to the request handler — the route the SDK posts to is what
         selects the wire format (see `dialects.DIALECTS`)."""
 
         async def handler(request: web.Request) -> web.StreamResponse:
+            secret = dialect.secret(request.headers)
             try:
-                return await self.handle_request(request, dialect)
+                return await self._tracked_request(
+                    secret,
+                    lambda: self.handle_request(request, dialect),
+                )
             except Exception as e:
                 session = self.sessions.get(dialect.secret(request.headers))
                 if session is None:
@@ -322,8 +396,12 @@ class InterceptionServer:
 
     def _aux_handler_for(self, dialect: Dialect, route: str):
         async def handler(request: web.Request) -> web.Response:
+            secret = dialect.secret(request.headers)
             try:
-                return await self.handle_aux(request, dialect, route)
+                return await self._tracked_request(
+                    secret,
+                    lambda: self.handle_aux(request, dialect, route),
+                )
             except Exception as e:
                 session = self.sessions.get(dialect.secret(request.headers))
                 if session is None:
@@ -348,11 +426,11 @@ class InterceptionServer:
                 app.router.add_post(aux, self._aux_handler_for(dialect, aux))
         # The shared-state back-channel (see `verifiers.v1.state`): a rollout's tool/user servers
         # GET/PUT their `self.state` here, keyed by the same bearer secret as the model routes.
-        app.router.add_get("/state", self.handle_state_get)
-        app.router.add_put("/state", self.handle_state_put)
+        app.router.add_get("/state", self._state_handler_for(self.handle_state_get))
+        app.router.add_put("/state", self._state_handler_for(self.handle_state_put))
         # A forked shared server (see `verifiers.v1.mcp.multiplex`) fetches its rollout's task here
         # to run `setup_task` per child — a shared server gets no task via env, keyed by the secret.
-        app.router.add_get("/task", self.handle_task_get)
+        app.router.add_get("/task", self._state_handler_for(self.handle_task_get))
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, _HOST, 0)
@@ -363,8 +441,20 @@ class InterceptionServer:
 
     async def __aexit__(self, *exc) -> None:
         logger.info("interception down: url=http://%s:%d", _HOST, self.port)
+        primary_cancel = len(exc) > 1 and isinstance(exc[1], asyncio.CancelledError)
+        drain_error: BaseException | None = None
+        for secret in tuple(self.sessions):
+            try:
+                await self.unregister(secret)
+            except BaseException as error:
+                drain_error = drain_error or error
         if self.runner is not None:
-            await self.runner.cleanup()
+            try:
+                await self.runner.cleanup()
+            except BaseException as error:
+                drain_error = drain_error or error
+        if drain_error is not None and not primary_cancel:
+            raise drain_error
 
     def _fail(
         self,
@@ -379,8 +469,7 @@ class InterceptionServer:
         re-raises it as the real cause, and report it to the harness as an HTTP error. ``status``
         distinguishes malformed harness requests (400) from transient failures; ``preserve`` keeps
         an earlier, more relevant turn failure while still returning the current error response."""
-        if not preserve or session.error is None:
-            session.error = error
+        session.record_error(error, preserve=preserve)
         logger.warning(
             "rollout %s failed: %s: %s", session.trace.id, type(error).__name__, error
         )
@@ -464,7 +553,10 @@ class InterceptionServer:
         ):
             if session.opening is None:
                 try:
-                    session.opening = await session.user("")
+                    opening = await session.user("")
+                    if session.closed:
+                        raise InterceptionError("rollout session is closed")
+                    session.opening = opening
                 except RolloutError as e:
                     return self._fail(session, dialect, e)
                 except Exception as e:
@@ -553,7 +645,7 @@ class InterceptionServer:
                 # An overlong prompt is a budget limit, not a crash: end the rollout cleanly
                 # as a truncation — return the last turn if there is one, else refuse to halt
                 # the harness (same shape as `refused` above).
-                session.trace.stop("context_length")
+                session.stop_trace("context_length")
                 logger.debug("prompt too long: id=%s", session.trace.id)
                 if completion is None:
                     return web.json_response(
@@ -564,7 +656,7 @@ class InterceptionServer:
             except RolloutError as e:
                 # Stash the real cause; the rollout re-raises it after the harness returns. Relay
                 # the provider's status so the harness SDK retries 5xx/429 and not 4xx.
-                session.error = e
+                session.record_error(e)
                 logger.warning(
                     "model call failed: id=%s %s: %s",
                     session.trace.id,
@@ -685,13 +777,13 @@ class InterceptionServer:
                 session_id=session.trace.id,
             )
         except OverlongPromptError:
-            session.trace.stop("context_length")
+            session.stop_trace("context_length")
             logger.debug("prompt too long: id=%s", session.trace.id)
             return web.json_response(
                 dialect.error_body("rollout stopped: context_length"), status=400
             )
         except RolloutError as e:
-            session.error = e
+            session.record_error(e)
             logger.warning(
                 "model call failed: id=%s %s: %s",
                 session.trace.id,
@@ -776,7 +868,7 @@ class InterceptionServer:
                     )
 
         if relay_error is not None:
-            session.error = session.error or relay_error
+            session.record_error(relay_error, preserve=True)
             logger.warning(
                 "stream model call failed during relay: id=%s %s: %s",
                 session.trace.id,
@@ -798,7 +890,7 @@ class InterceptionServer:
         except RolloutError as e:
             # The SSE status/body have already reached the harness, so an error cannot be relayed
             # now. Preserve it on the session for Rollout to raise after the harness returns.
-            session.error = e
+            session.record_error(e)
             logger.warning(
                 "stream model call failed after relay: id=%s %s: %s",
                 session.trace.id,
@@ -806,7 +898,7 @@ class InterceptionServer:
                 e,
             )
         except Exception as e:
-            session.error = _unexpected_model_error(e)
+            session.record_error(_unexpected_model_error(e))
             logger.warning(
                 "stream model call failed after relay: id=%s %s: %s",
                 session.trace.id,
@@ -817,7 +909,7 @@ class InterceptionServer:
             try:
                 committed = session.commit(turn, response)
             except RolloutError as e:
-                session.error = e
+                session.record_error(e)
                 logger.warning(
                     "stream model call failed after relay: id=%s %s: %s",
                     session.trace.id,
@@ -825,8 +917,10 @@ class InterceptionServer:
                     e,
                 )
             except Exception as e:
-                session.error = InterceptionError(
-                    f"committing streamed model turn failed: {type(e).__name__}: {e}"
+                session.record_error(
+                    InterceptionError(
+                        f"committing streamed model turn failed: {type(e).__name__}: {e}"
+                    )
                 )
                 logger.warning(
                     "stream model call failed after relay: id=%s %s: %s",
@@ -898,7 +992,7 @@ class InterceptionServer:
             result = await session.ctx.client.relay_aux(dialect, route, body)
         except RolloutError as e:
             # An aux call isn't a model turn, so don't clobber a pending turn error.
-            session.error = session.error or e
+            session.record_error(e, preserve=True)
             logger.warning(
                 "aux call failed: id=%s %s: %s",
                 session.trace.id,
@@ -970,5 +1064,7 @@ class InterceptionServer:
                 {"error": f"invalid state PUT for {state_cls.__name__}: {e}"},
                 status=400,
             )
+        if session.closed:
+            return web.json_response({"error": "unauthorized"}, status=401)
         session.trace.state = new_state
         return web.json_response({"ok": True})
