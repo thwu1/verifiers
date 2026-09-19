@@ -28,6 +28,49 @@ ISOLATED_PROGRAM_ENV = {
 }
 
 
+async def _run_thread_to_completion(function, /, *args):
+    """Run a blocking lifecycle operation without letting cancellation strand it.
+
+    ``asyncio.to_thread`` cannot stop its worker after the awaiting task is
+    cancelled. Shield the worker and remember every cancellation until the
+    blocking operation has reached a terminal state; callers can then release
+    any resource returned by a late constructor before re-raising cancellation.
+    """
+
+    operation = asyncio.create_task(asyncio.to_thread(function, *args))
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
+        except Exception:
+            # Retrieve and preserve the original exception via ``result`` below.
+            break
+    try:
+        return operation.result(), cancellation, None
+    except Exception as error:
+        return None, cancellation, error
+
+
+def _raise_cancellation(
+    cancellation: asyncio.CancelledError,
+    failures: list[Exception],
+) -> None:
+    if not failures:
+        raise cancellation
+    cause: Exception = (
+        failures[0]
+        if len(failures) == 1
+        else ExceptionGroup("VMVM lifecycle failures", failures)
+    )
+    cancellation.add_note(
+        "VMVM lifecycle diagnostics: "
+        + "; ".join(f"{type(error).__name__}: {error}" for error in failures)
+    )
+    raise cancellation from cause
+
+
 class VMVMBashResult(TypedDict):
     status: Literal["success", "error"]
     output: str
@@ -114,7 +157,9 @@ def shell_command(argv: list[str], env: dict[str, str], workdir: str) -> str:
     """Render one argv invocation for the backend's persistent Bash session."""
     command = shlex.join(argv)
     if env:
-        assignments = " ".join(shlex.quote(f"{key}={value}") for key, value in env.items())
+        assignments = " ".join(
+            shlex.quote(f"{key}={value}") for key, value in env.items()
+        )
         command = f"env {assignments} {command}"
     return f"cd {shlex.quote(workdir)} && {command}"
 
@@ -124,6 +169,7 @@ class VMVMRuntime(Runtime):
 
     is_local: ClassVar[bool] = False
     instance_host_endpoint: ClassVar[bool] = True
+    cleanup_must_succeed: ClassVar[bool] = True
 
     def __init__(self, config: VMVMConfig, name: str | None = None) -> None:
         super().__init__(name)
@@ -148,24 +194,77 @@ class VMVMRuntime(Runtime):
 
     async def start(self) -> None:
         backend: VMVMBackend | None = None
-        try:
-            backend = await asyncio.to_thread(create_backend, self.config)
-            result = await asyncio.to_thread(
+        cancellation: asyncio.CancelledError | None = None
+        failures: list[Exception] = []
+        created, current_cancellation, create_error = await _run_thread_to_completion(
+            create_backend, self.config
+        )
+        cancellation = current_cancellation
+        if create_error is not None:
+            failures.append(create_error)
+        elif created is None:
+            failures.append(
+                RuntimeError("VMVM backend construction returned no backend")
+            )
+        else:
+            backend = created
+        if backend is not None and cancellation is None and not failures:
+            result, current_cancellation, run_error = await _run_thread_to_completion(
                 backend.run_bash,
                 f"mkdir -p {shlex.quote(self.config.workdir)}",
                 self.config.session_timeout,
             )
-            if result["exit_code"] != 0:
-                raise RuntimeError(result["output"])
-        except Exception as error:
+            cancellation = current_cancellation
+            if run_error is not None:
+                failures.append(run_error)
+            elif cancellation is None:
+                try:
+                    if result["exit_code"] != 0:
+                        failures.append(RuntimeError(result["output"]))
+                except Exception as error:
+                    failures.append(error)
+        descriptor: str | None = None
+        if backend is not None and cancellation is None and not failures:
+            info, current_cancellation, info_error = await _run_thread_to_completion(
+                backend.get_debugging_info
+            )
+            cancellation = current_cancellation
+            if info_error is not None:
+                failures.append(info_error)
+            elif cancellation is None:
+                try:
+                    container_id = info.get("container_id")
+                    descriptor = (
+                        str(container_id) if container_id is not None else self.name
+                    )
+                except Exception as error:
+                    failures.append(error)
+        if cancellation is not None or failures:
             if backend is not None:
-                await asyncio.to_thread(backend.destroy)
-            raise SandboxError(f"VMVM provisioning failed: {error}") from error
+                (
+                    _,
+                    cleanup_cancellation,
+                    cleanup_error,
+                ) = await _run_thread_to_completion(backend.destroy)
+                cancellation = cancellation or cleanup_cancellation
+                if cleanup_error is not None:
+                    failures.append(cleanup_error)
+            if cancellation is not None:
+                _raise_cancellation(cancellation, failures)
+            if len(failures) > 1:
+                raise SandboxError(
+                    "VMVM provisioning failed and cleanup failed: "
+                    f"primary={type(failures[0]).__name__}: {failures[0]}; "
+                    f"cleanup={type(failures[-1]).__name__}: {failures[-1]}"
+                ) from failures[0]
+            assert failures
+            raise SandboxError(
+                f"VMVM provisioning failed: {failures[0]}"
+            ) from failures[0]
+        assert backend is not None
+        logger.info("vmvm: container %s up (image=%s)", descriptor, self.config.image)
+        self._descriptor = descriptor
         self._backend = backend
-        info = backend.get_debugging_info()
-        container_id = info.get("container_id")
-        self._descriptor = str(container_id) if container_id is not None else self.name
-        logger.info("vmvm: container %s up (image=%s)", self._descriptor, self.config.image)
 
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         if self._network_active:
@@ -173,7 +272,9 @@ class VMVMRuntime(Runtime):
         command = shell_command(argv, env, self.config.workdir)
         async with self._run_lock:
             try:
-                result = await asyncio.to_thread(self.backend.run_bash, command, self.config.session_timeout)
+                result = await asyncio.to_thread(
+                    self.backend.run_bash, command, self.config.session_timeout
+                )
             except Exception as error:
                 raise SandboxError(f"VMVM exec failed: {error}") from error
 
@@ -190,13 +291,19 @@ class VMVMRuntime(Runtime):
                 except Exception as error:
                     raise SandboxError(f"VMVM reconnect failed: {error}") from error
                 if not restarted:
-                    raise SandboxError("VMVM reconnect failed: sandbox state is unavailable")
+                    raise SandboxError(
+                        "VMVM reconnect failed: sandbox state is unavailable"
+                    )
                 try:
                     recovered = await asyncio.to_thread(self.backend.recover_last)
                 except Exception as error:
-                    raise SandboxError(f"VMVM command recovery failed: {error}") from error
+                    raise SandboxError(
+                        f"VMVM command recovery failed: {error}"
+                    ) from error
                 if recovered is None:
-                    raise SandboxError("VMVM command recovery failed: exact-once execution cannot be proven")
+                    raise SandboxError(
+                        "VMVM command recovery failed: exact-once execution cannot be proven"
+                    )
                 result = recovered
             if result["exit_code"] < 0 and result["error_type"] == "broken_pipe":
                 raise SandboxError(
@@ -204,14 +311,22 @@ class VMVMRuntime(Runtime):
                     f"{MAX_TRANSPORT_RECOVERY_ATTEMPTS} recovery attempts"
                 )
         if result["exit_code"] < 0:
-            raise SandboxError(f"VMVM exec failed ({result['error_type']}): {result['output']}")
-        return ProgramResult(exit_code=result["exit_code"], stdout=result["output"], stderr="")
+            raise SandboxError(
+                f"VMVM exec failed ({result['error_type']}): {result['output']}"
+            )
+        return ProgramResult(
+            exit_code=result["exit_code"], stdout=result["output"], stderr=""
+        )
 
-    async def run_background(self, argv: list[str], env: dict[str, str], log: str) -> None:
+    async def run_background(
+        self, argv: list[str], env: dict[str, str], log: str
+    ) -> None:
         inner = f"nohup {shlex.join(argv)} > {shlex.quote(log)} 2>&1 < /dev/null &"
         result = await self.run(["sh", "-c", inner], env)
         if result.exit_code != 0:
-            raise SandboxError(f"VMVM background launch failed: {result.stdout.strip()}")
+            raise SandboxError(
+                f"VMVM background launch failed: {result.stdout.strip()}"
+            )
 
     async def configure_network_policy(
         self,
@@ -221,11 +336,15 @@ class VMVMRuntime(Runtime):
         if mode == self._network_mode:
             return
         if self._network_mode == "no-network":
-            raise SandboxError("VMVM cannot relax an active no-network policy back to public")
+            raise SandboxError(
+                "VMVM cannot relax an active no-network policy back to public"
+            )
         try:
             await asyncio.to_thread(self.backend.prepare_network_isolation)
         except Exception as error:
-            raise SandboxError(f"VMVM network-isolation preparation failed: {error}") from error
+            raise SandboxError(
+                f"VMVM network-isolation preparation failed: {error}"
+            ) from error
         self._network_mode = "no-network"
 
     def defer_until_network_isolated(
@@ -246,7 +365,9 @@ class VMVMRuntime(Runtime):
                 try:
                     await asyncio.to_thread(self.backend.activate_network_isolation)
                 except Exception as error:
-                    raise SandboxError(f"VMVM network-isolation activation failed: {error}") from error
+                    raise SandboxError(
+                        f"VMVM network-isolation activation failed: {error}"
+                    ) from error
                 self._network_active = True
             commands, self._deferred_network_commands = (
                 self._deferred_network_commands,
@@ -255,7 +376,9 @@ class VMVMRuntime(Runtime):
             for argv, env in commands:
                 result = await self.run(argv, env)
                 if result.exit_code != 0:
-                    raise SandboxError(f"VMVM deferred isolated startup failed: {result.stdout[-2000:]}")
+                    raise SandboxError(
+                        f"VMVM deferred isolated startup failed: {result.stdout[-2000:]}"
+                    )
 
     async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         await self.activate_network_policy()
@@ -293,7 +416,9 @@ class VMVMRuntime(Runtime):
             "s.sendall(b'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'); "
             "data=s.recv(16); s.close(); assert data.startswith(b'HTTP/')"
         )
-        shell_probe = shlex.quote("printf 'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'")
+        shell_probe = shlex.quote(
+            "printf 'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'"
+        )
         probe_url = shlex.quote(f"http://{endpoint.hostname}:{endpoint.port}/")
         probe = (
             "if command -v python3 >/dev/null 2>&1; then "
@@ -326,7 +451,9 @@ class VMVMRuntime(Runtime):
         try:
             await self.activate_network_policy()
             if self._network_active and not await self.host_endpoint_is_reachable(url):
-                raise TunnelError("VMVM host tunnel was unreachable after no-network activation")
+                raise TunnelError(
+                    "VMVM host tunnel was unreachable after no-network activation"
+                )
             try:
                 yield url
             except Exception as body_error:
@@ -335,7 +462,9 @@ class VMVMRuntime(Runtime):
                 except Exception:
                     reachable = False
                 if not reachable:
-                    raise TunnelError("VMVM host tunnel became unreachable during the rollout") from body_error
+                    raise TunnelError(
+                        "VMVM host tunnel became unreachable during the rollout"
+                    ) from body_error
                 raise
         finally:
             await asyncio.to_thread(self.backend.close_host_tunnel, tunnel)
@@ -344,3 +473,20 @@ class VMVMRuntime(Runtime):
         backend, self._backend = self._backend, None
         if backend is not None:
             backend.destroy()
+
+    async def stop(self) -> None:
+        backend, self._backend = self._backend, None
+        if backend is None:
+            return
+        _, cancellation, cleanup_error = await _run_thread_to_completion(
+            backend.destroy
+        )
+        if cancellation is not None:
+            _raise_cancellation(
+                cancellation,
+                [cleanup_error] if cleanup_error is not None else [],
+            )
+        if cleanup_error is not None:
+            raise SandboxError(
+                f"VMVM cleanup failed: {cleanup_error}"
+            ) from cleanup_error
