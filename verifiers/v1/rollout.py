@@ -129,7 +129,12 @@ class Rollout:
             async with InterceptionServer() as server:
                 secret = server.register(session)
                 # a HOST service the harness (in `runtime`) reaches: localhost or a tunnel
-                async with reachable_url(HOST, server.port, consumer=runtime) as url:
+                async with reachable_url(
+                    HOST,
+                    server.port,
+                    consumer=None if self.harness.RUNS_ON_HOST else runtime,
+                    consumer_is_local=self.harness.RUNS_ON_HOST,
+                ) as url:
                     yield f"{url}/v1", secret, server.port, url
 
     async def run(self) -> Trace:

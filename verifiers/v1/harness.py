@@ -46,7 +46,9 @@ class HarnessConfig(BaseConfig):
     """Where the harness runs (subprocess / docker / prime / modal / vmvm). Subprocess by default — a local
     process on the host; a taskset that needs a container (its own image, or NEEDS_CONTAINER)
     selects `--harness.runtime.type docker` (or another container runtime). Lives on the harness — it's the
-    harness's box; tool servers have their own placement (see `TasksetConfig.tools`)."""
+    harness's box; tool servers have their own placement (see `TasksetConfig.tools`). A harness
+    with ``RUNS_ON_HOST`` keeps its model loop in the controller and uses this as the task/tool
+    runtime instead."""
     env: dict[str, str] = Field(default_factory=dict)
     """Additional environment variables for the harness program. Harness-owned endpoint,
     authentication, and model variables take precedence."""
@@ -74,6 +76,11 @@ class Harness(ABC, Generic[ConfigT]):
     """Drive a task's user simulator (multi-turn user injection); opt in per harness."""
     SUPPORTS_MESSAGE_PROMPT: ClassVar[bool] = False
     """Accept a Messages-list task.prompt (e.g. an image-bearing prompt); opt in per harness."""
+    RUNS_ON_HOST: ClassVar[bool] = False
+    """The model/tool loop executes in the controller process, while ``runtime`` remains the
+    task sandbox. Host-side harnesses use the local interception endpoint and call runtime
+    methods explicitly for tool execution; ordinary harnesses launch their program in the
+    runtime and leave this false."""
 
     def __init__(self, config: ConfigT) -> None:
         self.config = config
@@ -87,7 +94,11 @@ class Harness(ABC, Generic[ConfigT]):
         the user simulator opens the conversation (see `Taskset.user`); the harness emits no
         opening user message."""
         prompt = task.prompt
-        if prompt is not None and not isinstance(prompt, str) and not self.SUPPORTS_MESSAGE_PROMPT:
+        if (
+            prompt is not None
+            and not isinstance(prompt, str)
+            and not self.SUPPORTS_MESSAGE_PROMPT
+        ):
             raise ValueError(
                 f"Harness {self.config.id!r} does not support a Messages prompt; task.prompt must be a string or None."
             )
@@ -128,7 +139,9 @@ class Harness(ABC, Generic[ConfigT]):
         if result.exit_code != 0:
             # The real cause is at the END of a traceback, so keep the tail.
             detail = (result.stderr or result.stdout).strip()[-2000:] or "<no output>"
-            raise HarnessError(f"harness {self.config.id!r} exited {result.exit_code}: {detail}")
+            raise HarnessError(
+                f"harness {self.config.id!r} exited {result.exit_code}: {detail}"
+            )
         trace.stop("agent_completed")
 
     async def score(self, trace: Trace, runtime: Runtime) -> None:
