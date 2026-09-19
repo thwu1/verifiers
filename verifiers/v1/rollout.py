@@ -23,6 +23,7 @@ from verifiers.v1.decorators import discover_decorated
 from verifiers.v1.errors import (
     HarnessError,
     RolloutError,
+    SandboxError,
     TasksetError,
     ToolsetError,
     boundary,
@@ -157,7 +158,9 @@ class Rollout:
             session = RolloutSession(ctx, trace, stops, self.limits)
             await runtime.start()
             setup_deadline = (
-                None if self.setup_timeout is None else asyncio.get_running_loop().time() + self.setup_timeout
+                None
+                if self.setup_timeout is None
+                else asyncio.get_running_loop().time() + self.setup_timeout
             )
             async with (
                 boundary(TasksetError, "taskset setup"),
@@ -169,7 +172,9 @@ class Rollout:
                 asyncio.timeout_at(setup_deadline),
             ):
                 await self.harness.setup(runtime)
-            async with self._serve_interception(self.interception, runtime, session) as (
+            async with self._serve_interception(
+                self.interception, runtime, session
+            ) as (
                 endpoint,
                 secret,
                 state_port,
@@ -214,7 +219,9 @@ class Rollout:
                     # (like max_turns), even if its last call had failed.
                     try:
                         await asyncio.wait_for(
-                            self.harness.run(ctx, trace, runtime, endpoint, secret, urls),
+                            self.harness.run(
+                                ctx, trace, runtime, endpoint, secret, urls
+                            ),
                             self.harness_timeout,
                         )
                     except TimeoutError:
@@ -237,7 +244,9 @@ class Rollout:
                 )
             now = time.time()
             trace.timing.finalize.end = now
-            self.phase = Phase.SCORING  # per-rollout scoring; the Episode marks DONE after group scoring
+            self.phase = (
+                Phase.SCORING
+            )  # per-rollout scoring; the Episode marks DONE after group scoring
             trace.timing.scoring.start = now
             async with boundary(TasksetError, "scoring"):
                 # Per-rollout scoring: taskset + harness, concurrently, both with the live
@@ -288,8 +297,21 @@ class Rollout:
                 # `runtime` is always set: make_runtime() ran before the `try`.
                 try:
                     await runtime.stop()
-                except Exception:
-                    logger.warning("runtime teardown failed (rollout %s)", trace.id, exc_info=True)
+                except Exception as error:
+                    if runtime.cleanup_must_succeed and trace.error is None:
+                        trace.capture_error(
+                            error
+                            if isinstance(error, RolloutError)
+                            else SandboxError(
+                                f"runtime teardown: {type(error).__name__}: {error}"
+                            )
+                        )
+                    else:
+                        logger.warning(
+                            "runtime teardown failed (rollout %s)",
+                            trace.id,
+                            exc_info=True,
+                        )
         logger.info(
             "rollout done: id=%s task=%s reward=%.3f turns=%d stop=%s",
             trace.id,
