@@ -70,7 +70,12 @@ async def test_host_side_harness_uses_local_interception_without_runtime_tunnel(
     )
 
     async with pool:
-        async with pool.acquire(object(), runtime) as (endpoint, _secret, port, base):
+        async with pool.acquire(SimpleNamespace(closed=False), runtime) as (
+            endpoint,
+            _secret,
+            port,
+            base,
+        ):
             assert endpoint == f"http://127.0.0.1:{port}/v1"
             assert base == f"http://127.0.0.1:{port}"
 
@@ -85,7 +90,12 @@ async def test_remote_harness_keeps_instance_host_endpoint() -> None:
     )
 
     async with pool:
-        async with pool.acquire(object(), runtime) as (endpoint, _secret, port, base):
+        async with pool.acquire(SimpleNamespace(closed=False), runtime) as (
+            endpoint,
+            _secret,
+            port,
+            base,
+        ):
             assert endpoint == f"https://remote.example/{port}/v1"
             assert base == f"https://remote.example/{port}"
 
@@ -117,7 +127,9 @@ async def test_nonpooled_host_harness_uses_local_interception() -> None:
         runtime_config=host_sandoq_config(),
     )
 
-    async with rollout._serve_interception(None, runtime, object()) as (
+    async with rollout._serve_interception(
+        None, runtime, SimpleNamespace(closed=False)
+    ) as (
         endpoint,
         _secret,
         _state_port,

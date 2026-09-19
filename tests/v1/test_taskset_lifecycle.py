@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from verifiers.v1.env import Environment
 from verifiers.v1.episode import Episode
+from verifiers.v1.errors import SandboxError
 from verifiers.v1.rollout import Rollout
 from verifiers.v1.runtimes import ProgramResult, Runtime
 from verifiers.v1.task import Task
@@ -26,6 +27,7 @@ class LifecycleRuntime(Runtime):
         self.events = events
         self.cleanup_must_succeed = cleanup_must_succeed
         self.stop_failure = stop_failure
+        self.unusable_error: SandboxError | None = None
 
     async def start(self) -> None:
         self.events.append("runtime-start")
@@ -43,6 +45,10 @@ class LifecycleRuntime(Runtime):
 
     async def write(self, path: str, data: bytes) -> None:
         return None
+
+    def ensure_usable(self) -> None:
+        if self.unusable_error is not None:
+            raise self.unusable_error
 
 
 class LifecycleTaskset(Taskset):
@@ -199,6 +205,194 @@ async def test_integrity_critical_stop_failure_preserves_existing_error(
     assert "harness failure" in trace.error.message
     assert "runtime stop failure" not in trace.error.message
     assert events[-2:] == ["taskset-cleanup", "runtime-stop"]
+
+
+async def test_sandbox_cancellation_failure_skips_finalize_and_scoring(
+    monkeypatch,
+) -> None:
+    rollout, harness, events = make_rollout(
+        monkeypatch,
+        block=False,
+        failure_stage="none",
+    )
+
+    async def fail_cancel(*args, **kwargs) -> None:
+        events.append("harness-run")
+        raise SandboxError("command cancellation failed")
+
+    harness.run = fail_cancel
+    trace = await rollout.run()
+
+    assert trace.error is not None
+    assert trace.error.type == "SandboxError"
+    assert trace.stop_condition == "error"
+    assert "taskset-finalize" not in events
+    assert "taskset-score" not in events
+    assert "harness-score" not in events
+    assert events[-2:] == ["taskset-cleanup", "runtime-stop"]
+
+
+async def test_harness_timeout_waits_for_failed_cancellation_and_skips_scoring(
+    monkeypatch,
+) -> None:
+    rollout, harness, events = make_rollout(
+        monkeypatch,
+        block=False,
+        failure_stage="none",
+    )
+
+    async def fail_while_cancelling(*args, **kwargs) -> None:
+        events.append("harness-run")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("command-drained")
+            assert isinstance(rollout.runtime, LifecycleRuntime)
+            rollout.runtime.unusable_error = SandboxError("command cancellation failed")
+            raise
+
+    harness.run = fail_while_cancelling
+    rollout.harness_timeout = 0.01
+    trace = await rollout.run()
+
+    assert trace.error is not None
+    assert trace.error.type == "SandboxError"
+    assert trace.stop_condition == "error"
+    assert "taskset-finalize" not in events
+    assert "taskset-score" not in events
+    assert "harness-score" not in events
+    assert "taskset-cleanup" not in events
+    assert events[-2:] == ["command-drained", "runtime-stop"]
+
+
+async def test_unusable_runtime_quiesces_before_taskset_cleanup(monkeypatch) -> None:
+    rollout, harness, events = make_rollout(
+        monkeypatch,
+        block=False,
+        failure_stage="none",
+    )
+    stop_started = asyncio.Event()
+    worker_finished = asyncio.Event()
+
+    async def fail_while_cancelling(*args, **kwargs) -> None:
+        events.append("harness-run")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            assert isinstance(rollout.runtime, LifecycleRuntime)
+            rollout.runtime.unusable_error = SandboxError("command cancellation failed")
+            rollout.runtime.stop = stop_after_quarantine
+            raise
+
+    async def stop_after_quarantine() -> None:
+        events.append("runtime-stop-start")
+        stop_started.set()
+        await worker_finished.wait()
+        events.append("worker-finished")
+
+    harness.run = fail_while_cancelling
+    rollout.harness_timeout = 0.01
+    running = asyncio.create_task(rollout.run())
+
+    await asyncio.wait_for(stop_started.wait(), timeout=1)
+    assert "taskset-cleanup" not in events
+    worker_finished.set()
+    trace = await asyncio.wait_for(running, timeout=1)
+
+    assert trace.error is not None
+    assert trace.error.type == "SandboxError"
+    assert "taskset-cleanup" not in events
+    assert events[-2:] == ["runtime-stop-start", "worker-finished"]
+
+
+async def test_suppressed_timeout_still_checks_runtime_before_scoring(
+    monkeypatch,
+) -> None:
+    rollout, harness, events = make_rollout(
+        monkeypatch,
+        block=False,
+        failure_stage="none",
+    )
+
+    async def suppress_cancellation(*args, **kwargs) -> None:
+        events.append("harness-run")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("command-drained")
+            assert isinstance(rollout.runtime, LifecycleRuntime)
+            rollout.runtime.unusable_error = SandboxError("command cancellation failed")
+
+    harness.run = suppress_cancellation
+    rollout.harness_timeout = 0.01
+    trace = await rollout.run()
+
+    assert trace.error is not None
+    assert trace.error.type == "SandboxError"
+    assert trace.stop_condition == "error"
+    assert "taskset-finalize" not in events
+    assert "taskset-score" not in events
+    assert "taskset-cleanup" not in events
+    assert events[-2:] == ["command-drained", "runtime-stop"]
+
+
+async def test_parent_cancellation_propagates_even_when_runtime_becomes_unusable(
+    monkeypatch,
+) -> None:
+    rollout, harness, events = make_rollout(
+        monkeypatch,
+        block=False,
+        failure_stage="none",
+    )
+
+    async def invalidate_while_cancelling(*args, **kwargs) -> None:
+        events.append("harness-run")
+        harness.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("command-drained")
+            assert isinstance(rollout.runtime, LifecycleRuntime)
+            rollout.runtime.unusable_error = SandboxError("command cancellation failed")
+            raise
+
+    harness.run = invalidate_while_cancelling
+    rollout.harness_timeout = 60
+    running = asyncio.create_task(rollout.run())
+    await harness.started.wait()
+    running.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert "taskset-finalize" not in events
+    assert "taskset-score" not in events
+    assert "taskset-cleanup" not in events
+    assert events[-2:] == ["command-drained", "runtime-stop"]
+
+
+async def test_harness_timeout_drains_before_finalize_and_scoring(monkeypatch) -> None:
+    rollout, harness, events = make_rollout(
+        monkeypatch,
+        block=False,
+        failure_stage="none",
+    )
+
+    async def drain_while_cancelling(*args, **kwargs) -> None:
+        events.append("harness-run")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("command-drained")
+
+    harness.run = drain_while_cancelling
+    rollout.harness_timeout = 0.01
+    trace = await rollout.run()
+
+    assert trace.error is None
+    assert trace.stop_condition == "harness_timeout"
+    assert events.index("command-drained") < events.index("taskset-finalize")
+    assert events.index("taskset-finalize") < events.index("taskset-score")
 
 
 async def test_cleanup_failure_does_not_replace_existing_rollout_error(

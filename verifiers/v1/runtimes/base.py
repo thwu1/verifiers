@@ -180,6 +180,9 @@ class Runtime(ABC):
         source of truth for teardown: usable from the atexit backstop where async machinery
         is dead, and run off the event loop by `stop` on the normal path. Default no-op."""
 
+    def ensure_usable(self) -> None:
+        """Raise when cancellation left this runtime unsafe for later lifecycle phases."""
+
     # --- execution ---
 
     @abstractmethod
