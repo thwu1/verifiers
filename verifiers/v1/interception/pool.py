@@ -34,6 +34,8 @@ class PooledServer:
     # (VMVM) opens its own route to this server while it holds a pool slot.
     base_url: str | None
     load: int = 0
+    healthy: bool = True
+    draining: int = 0
 
 
 class InterceptionPool:
@@ -65,7 +67,7 @@ class InterceptionPool:
         """A server with spare capacity — reuse one under `multiplex`, else bring up a new one
         (its own host endpoint). The caller holds `_lock`."""
         for entry in self._servers:
-            if entry.load < self.multiplex:
+            if entry.healthy and entry.draining == 0 and entry.load < self.multiplex:
                 return entry
         server = InterceptionServer()
         await self._stack.enter_async_context(server)
@@ -97,12 +99,64 @@ class InterceptionPool:
             entry = await self._entry()
             secret = entry.server.register(session)
             entry.load += 1
+
+        released = False
+        primary_error: BaseException | None = None
+
+        async def release() -> None:
+            nonlocal released
+            async with self._lock:
+                if released:
+                    return
+                released = True
+                # Exclude new admissions before unregister starts.  Multiple
+                # sessions can drain concurrently, hence a count rather than a
+                # boolean; the entry is reusable only after every drain succeeds.
+                entry.draining += 1
+            try:
+                await entry.server.unregister(secret)
+            except BaseException:
+                async with self._lock:
+                    entry.healthy = False
+                raise
+            finally:
+                async with self._lock:
+                    entry.draining -= 1
+                    entry.load -= 1
+
         try:
             if entry.base_url is not None:
-                yield f"{entry.base_url}/v1", secret, entry.server.port, entry.base_url
+                try:
+                    yield f"{entry.base_url}/v1", secret, entry.server.port, entry.base_url
+                except BaseException as error:
+                    primary_error = error
+                    raise
+                finally:
+                    try:
+                        await release()
+                    except BaseException:
+                        if not isinstance(primary_error, asyncio.CancelledError):
+                            raise
             else:
                 async with runtime.host_endpoint(entry.server.port) as base_url:
-                    yield f"{base_url}/v1", secret, entry.server.port, base_url
+                    try:
+                        yield f"{base_url}/v1", secret, entry.server.port, base_url
+                    except BaseException as error:
+                        primary_error = error
+                        raise
+                    finally:
+                        try:
+                            await release()
+                        except BaseException:
+                            if not isinstance(primary_error, asyncio.CancelledError):
+                                raise
+        except BaseException as error:
+            primary_error = primary_error or error
+            raise
         finally:
-            entry.server.unregister(secret)
-            entry.load -= 1
+            if not released:
+                try:
+                    await release()
+                except BaseException:
+                    if not isinstance(primary_error, asyncio.CancelledError):
+                        raise
