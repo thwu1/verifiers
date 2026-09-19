@@ -15,15 +15,25 @@ pytestmark = pytest.mark.asyncio
 
 
 class LifecycleRuntime(Runtime):
-    def __init__(self, events: list[str]) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        cleanup_must_succeed: bool = False,
+        stop_failure: bool = False,
+    ) -> None:
         super().__init__()
         self.events = events
+        self.cleanup_must_succeed = cleanup_must_succeed
+        self.stop_failure = stop_failure
 
     async def start(self) -> None:
         self.events.append("runtime-start")
 
     async def stop(self) -> None:
         self.events.append("runtime-stop")
+        if self.stop_failure:
+            raise RuntimeError("runtime stop failure")
 
     async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         return ProgramResult(exit_code=0, stdout="", stderr="")
@@ -36,7 +46,9 @@ class LifecycleRuntime(Runtime):
 
 
 class LifecycleTaskset(Taskset):
-    def __init__(self, events: list[str], failure_stage: str, *, cleanup_failure: bool = False) -> None:
+    def __init__(
+        self, events: list[str], failure_stage: str, *, cleanup_failure: bool = False
+    ) -> None:
         super().__init__(TasksetConfig(id="lifecycle-test"))
         self.events = events
         self.failure_stage = failure_stage
@@ -103,12 +115,20 @@ def make_rollout(
     block: bool,
     failure_stage: str = "harness",
     cleanup_failure: bool = False,
+    runtime_cleanup_must_succeed: bool = False,
+    runtime_stop_failure: bool = False,
 ) -> tuple[Rollout, LifecycleHarness, list[str]]:
     events: list[str] = []
-    runtime = LifecycleRuntime(events)
+    runtime = LifecycleRuntime(
+        events,
+        cleanup_must_succeed=runtime_cleanup_must_succeed,
+        stop_failure=runtime_stop_failure,
+    )
     taskset = LifecycleTaskset(events, failure_stage, cleanup_failure=cleanup_failure)
     harness = LifecycleHarness(events, block=block, failure_stage=failure_stage)
-    monkeypatch.setattr("verifiers.v1.rollout.make_runtime", lambda config, name: runtime)
+    monkeypatch.setattr(
+        "verifiers.v1.rollout.make_runtime", lambda config, name: runtime
+    )
     monkeypatch.setattr(Rollout, "_serve_interception", fake_interception)
     rollout = Rollout(
         task=Task(idx=0, prompt="test"),
@@ -121,8 +141,12 @@ def make_rollout(
 
 
 @pytest.mark.parametrize("failure_stage", ["setup", "harness", "finalize", "scoring"])
-async def test_taskset_cleanup_runs_before_runtime_stop_on_failure(monkeypatch, failure_stage) -> None:
-    rollout, _, events = make_rollout(monkeypatch, block=False, failure_stage=failure_stage)
+async def test_taskset_cleanup_runs_before_runtime_stop_on_failure(
+    monkeypatch, failure_stage
+) -> None:
+    rollout, _, events = make_rollout(
+        monkeypatch, block=False, failure_stage=failure_stage
+    )
 
     trace = await rollout.run()
 
@@ -140,7 +164,46 @@ async def test_taskset_cleanup_runs_on_success(monkeypatch) -> None:
     assert events[-2:] == ["taskset-cleanup", "runtime-stop"]
 
 
-async def test_cleanup_failure_does_not_replace_existing_rollout_error(monkeypatch) -> None:
+async def test_integrity_critical_runtime_stop_failure_is_captured(monkeypatch) -> None:
+    rollout, _, events = make_rollout(
+        monkeypatch,
+        block=False,
+        failure_stage="none",
+        runtime_cleanup_must_succeed=True,
+        runtime_stop_failure=True,
+    )
+
+    trace = await rollout.run()
+
+    assert trace.error is not None
+    assert trace.error.type == "SandboxError"
+    assert "runtime stop failure" in trace.error.message
+    assert events[-2:] == ["taskset-cleanup", "runtime-stop"]
+
+
+async def test_integrity_critical_stop_failure_preserves_existing_error(
+    monkeypatch,
+) -> None:
+    rollout, _, events = make_rollout(
+        monkeypatch,
+        block=False,
+        failure_stage="harness",
+        runtime_cleanup_must_succeed=True,
+        runtime_stop_failure=True,
+    )
+
+    trace = await rollout.run()
+
+    assert trace.error is not None
+    assert trace.error.type == "RuntimeError"
+    assert "harness failure" in trace.error.message
+    assert "runtime stop failure" not in trace.error.message
+    assert events[-2:] == ["taskset-cleanup", "runtime-stop"]
+
+
+async def test_cleanup_failure_does_not_replace_existing_rollout_error(
+    monkeypatch,
+) -> None:
     rollout, _, events = make_rollout(
         monkeypatch,
         block=False,
@@ -156,7 +219,9 @@ async def test_cleanup_failure_does_not_replace_existing_rollout_error(monkeypat
     assert events[-2:] == ["taskset-cleanup", "runtime-stop"]
 
 
-async def test_taskset_cleanup_runs_before_runtime_stop_on_cancellation(monkeypatch) -> None:
+async def test_taskset_cleanup_runs_before_runtime_stop_on_cancellation(
+    monkeypatch,
+) -> None:
     rollout, harness, events = make_rollout(monkeypatch, block=True)
     running = asyncio.create_task(rollout.run())
     await harness.started.wait()
@@ -169,7 +234,9 @@ async def test_taskset_cleanup_runs_before_runtime_stop_on_cancellation(monkeypa
     assert events.count("taskset-cleanup") == 1
 
 
-async def test_environment_serving_closes_taskset_after_resources_on_cancellation() -> None:
+async def test_environment_serving_closes_taskset_after_resources_on_cancellation() -> (
+    None
+):
     events: list[str] = []
     taskset = LifecycleTaskset(events, failure_stage="none")
 
@@ -236,7 +303,9 @@ async def test_environment_serving_closes_taskset_when_resource_enter_fails() ->
     assert events == ["taskset-close"]
 
 
-async def test_episode_quiesces_sibling_rollouts_when_persistence_fails(monkeypatch) -> None:
+async def test_episode_quiesces_sibling_rollouts_when_persistence_fails(
+    monkeypatch,
+) -> None:
     events: list[str] = []
     both_started = asyncio.Event()
     started = 0
