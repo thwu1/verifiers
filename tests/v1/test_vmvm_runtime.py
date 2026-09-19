@@ -1,4 +1,8 @@
+import asyncio
+import threading
+
 import pytest
+
 from verifiers.v1.errors import ProviderError, SandboxError, TunnelError
 from verifiers.v1.runtimes import (
     VMVMConfig,
@@ -40,7 +44,9 @@ class FakeBackend:
         return self.recovery_results.pop(0)
 
     def transfer_file(self, file_content: str | bytes, remote_path: str) -> None:
-        self.files[remote_path] = file_content.encode() if isinstance(file_content, str) else file_content
+        self.files[remote_path] = (
+            file_content.encode() if isinstance(file_content, str) else file_content
+        )
 
     def read_file(self, remote_path: str) -> bytes:
         return self.files[remote_path]
@@ -77,12 +83,15 @@ async def test_vmvm_runtime_lifecycle(monkeypatch) -> None:
     runtime = make_runtime(config, "rollout-1")
 
     assert isinstance(runtime, VMVMRuntime)
+    assert runtime.cleanup_must_succeed is True
     assert runtime_is_local(config) is False
     assert runtime_has_instance_host_endpoint(config) is True
     await runtime.start()
     assert runtime.descriptor == "abc123"
 
-    result = await runtime.run(["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"})
+    result = await runtime.run(
+        ["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"}
+    )
     assert result.exit_code == 0
     assert result.stdout == "ok"
     assert backend.commands == [
@@ -104,6 +113,202 @@ async def test_vmvm_runtime_lifecycle(monkeypatch) -> None:
 
     await runtime.stop()
     assert backend.destroyed is True
+
+
+async def test_vmvm_runtime_propagates_destroy_failure(monkeypatch) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+
+    def fail_destroy() -> None:
+        raise RuntimeError("release receipt unavailable")
+
+    backend.destroy = fail_destroy
+    with pytest.raises(
+        SandboxError, match="VMVM cleanup failed: release receipt unavailable"
+    ):
+        await runtime.stop()
+
+
+async def test_vmvm_runtime_stop_finishes_cleanup_under_repeated_cancellation(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_destroy() -> None:
+        entered.set()
+        assert release.wait(timeout=5)
+        backend.destroyed = True
+
+    backend.destroy = blocking_destroy
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+
+    stopping = asyncio.create_task(runtime.stop())
+    assert await asyncio.to_thread(entered.wait, 5)
+    stopping.cancel()
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    stopping.cancel()
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    assert backend.destroyed is True
+
+
+async def test_vmvm_runtime_cancelled_start_destroys_late_backend(monkeypatch) -> None:
+    backend = FakeBackend()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def delayed_create(_config) -> FakeBackend:
+        entered.set()
+        assert release.wait(timeout=5)
+        return backend
+
+    monkeypatch.setattr(vmvm, "create_backend", delayed_create)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    starting = asyncio.create_task(runtime.start())
+    assert await asyncio.to_thread(entered.wait, 5)
+    starting.cancel()
+    await asyncio.sleep(0)
+    assert not starting.done()
+    starting.cancel()
+    await asyncio.sleep(0)
+    assert not starting.done()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    assert backend.destroyed is True
+    assert runtime._backend is None
+
+
+async def test_vmvm_runtime_cancelled_stop_preserves_cleanup_failure(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_failed_destroy() -> None:
+        entered.set()
+        assert release.wait(timeout=5)
+        raise RuntimeError("release failed")
+
+    backend.destroy = blocking_failed_destroy
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    await runtime.start()
+
+    stopping = asyncio.create_task(runtime.stop())
+    assert await asyncio.to_thread(entered.wait, 5)
+    stopping.cancel()
+    await asyncio.sleep(0)
+    stopping.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await stopping
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "release failed" in "\n".join(caught.value.__notes__)
+
+
+async def test_vmvm_runtime_cancelled_constructor_preserves_failure(
+    monkeypatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def delayed_failed_create(_config) -> FakeBackend:
+        entered.set()
+        assert release.wait(timeout=5)
+        raise RuntimeError("constructor failed")
+
+    monkeypatch.setattr(vmvm, "create_backend", delayed_failed_create)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+    starting = asyncio.create_task(runtime.start())
+    assert await asyncio.to_thread(entered.wait, 5)
+    starting.cancel()
+    await asyncio.sleep(0)
+    starting.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await starting
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "constructor failed" in "\n".join(caught.value.__notes__)
+
+
+async def test_vmvm_runtime_preserves_provisioning_and_cleanup_failures(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+    backend.result = {
+        "status": "error",
+        "output": "mkdir failed",
+        "error_type": "exit",
+        "exit_code": 1,
+    }
+
+    def fail_destroy() -> None:
+        raise RuntimeError("release failed")
+
+    backend.destroy = fail_destroy
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+
+    with pytest.raises(
+        SandboxError, match="provisioning failed and cleanup failed"
+    ) as caught:
+        await runtime.start()
+
+    assert "mkdir failed" in str(caught.value)
+    assert "release failed" in str(caught.value)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+async def test_vmvm_runtime_malformed_provisioning_result_destroys_backend(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+    backend.run_bash = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+
+    with pytest.raises(SandboxError, match="VMVM provisioning failed"):
+        await runtime.start()
+
+    assert backend.destroyed is True
+    assert runtime._backend is None
+
+
+async def test_vmvm_runtime_debug_identity_failure_destroys_backend(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+
+    def fail_debugging_info() -> dict[str, object]:
+        raise RuntimeError("debug identity failed")
+
+    backend.get_debugging_info = fail_debugging_info
+    monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
+    runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
+
+    with pytest.raises(SandboxError, match="debug identity failed"):
+        await runtime.start()
+
+    assert backend.destroyed is True
+    assert runtime._backend is None
 
 
 async def test_vmvm_runtime_activates_network_before_deferred_startup_and_program(
@@ -138,7 +343,9 @@ async def test_vmvm_runtime_activates_network_before_deferred_startup_and_progra
     assert result.exit_code == 0
     assert backend.network_prepare_calls == 1
     assert events == ["activate", "startup", "program"]
-    isolated_commands = [command for command, _ in backend.commands if "NO_PROXY=*" in command]
+    isolated_commands = [
+        command for command, _ in backend.commands if "NO_PROXY=*" in command
+    ]
     assert len(isolated_commands) == 3
     assert any("socket.create_connection" in command for command in isolated_commands)
     assert any("curl --noproxy" in command for command in isolated_commands)
@@ -202,7 +409,11 @@ async def test_vmvm_runtime_preserves_body_error_when_tunnel_remains_reachable(
             raise body_error
 
     assert caught.value is body_error
-    probes = [command for command, _ in backend.commands if "socket.create_connection" in command]
+    probes = [
+        command
+        for command, _ in backend.commands
+        if "socket.create_connection" in command
+    ]
     assert len(probes) == 1
     assert "NO_PROXY=*" in probes[0]
     assert "curl --noproxy" in probes[0]
@@ -255,7 +466,9 @@ async def test_vmvm_runtime_does_not_recover_command_timeout(monkeypatch) -> Non
     await runtime.stop()
 
 
-async def test_vmvm_runtime_recovers_in_flight_command_exactly_once(monkeypatch) -> None:
+async def test_vmvm_runtime_recovers_in_flight_command_exactly_once(
+    monkeypatch,
+) -> None:
     backend = FakeBackend()
     monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
@@ -284,7 +497,9 @@ async def test_vmvm_runtime_recovers_in_flight_command_exactly_once(monkeypatch)
     await runtime.stop()
 
 
-async def test_vmvm_runtime_recovers_across_repeated_transport_drops(monkeypatch) -> None:
+async def test_vmvm_runtime_recovers_across_repeated_transport_drops(
+    monkeypatch,
+) -> None:
     backend = FakeBackend()
     monkeypatch.setattr(vmvm, "create_backend", lambda config: backend)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
