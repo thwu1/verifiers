@@ -223,15 +223,14 @@ async def test_sandoq_runtime_lifecycle(monkeypatch) -> None:
     assert client.request.docker_image == "swebench/image"
     assert client.request.start_command is None
     assert getattr(client.request, "vm", False) is False
-    assert client.request.environment_vars == {"OCI_EXPECTED_WORKDIR": "/tmp"}
+    assert client.request.environment_vars == {"OCI_EXPECTED_WORKDIR": "/testbed"}
 
     result = await runtime.run(
         ["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"}
     )
     assert result.exit_code == 0
     assert result.stdout == "ok"
-    assert client.commands[:2] == [
-        ("mkdir -p /testbed", "/tmp", {}, 123),
+    assert client.commands == [
         ("sh -c 'printf ok'", "/testbed", {"MESSAGE": "value with spaces"}, 123),
     ]
 
@@ -246,6 +245,20 @@ async def test_sandoq_runtime_lifecycle(monkeypatch) -> None:
     await runtime.stop()
     assert client.deleted == ["assignment-123"]
     assert client.closed is True
+
+
+async def test_sandoq_environment_mode_creates_configured_workdir(monkeypatch) -> None:
+    client = FakeSandoqClient()
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(
+        SandoqConfig(mode="environment", workdir="/workspace", host_tunnel="modal")
+    )
+
+    await runtime.start()
+
+    assert client.request.environment_vars is None
+    assert client.commands == [("mkdir -p /workspace", "/", {}, 3600)]
+    await runtime.stop()
 
 
 @pytest.mark.parametrize(
