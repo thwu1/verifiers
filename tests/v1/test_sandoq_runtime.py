@@ -1,5 +1,7 @@
 import asyncio
+import stat
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -72,10 +74,11 @@ class FakeSandoqClient:
         assert sandbox_id == "assignment-123"
         Path(local_path).write_bytes(self.files[path])
 
-    async def delete(self, sandbox_id: str) -> None:
+    async def delete(self, sandbox_id: str):
         if self.delete_error is not None:
             raise self.delete_error
         self.deleted.append(sandbox_id)
+        return {"status": "deleted", "verified_http_status": 404}
 
     async def aclose(self) -> None:
         self.closed = True
@@ -95,6 +98,12 @@ def test_sandoq_no_network_rejects_unapproved_precreate_config(
     monkeypatch, environment: str, task_network: str
 ) -> None:
     constructed = []
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda _path: SimpleNamespace(st_mode=stat.S_IFREG | 0o600),
+    )
+    monkeypatch.setattr(Path, "is_symlink", lambda _path: False)
     module = ModuleType("sandoq_provider.oci_client")
     module.get_oci_config = lambda: SimpleNamespace(
         environment=environment,
@@ -114,17 +123,22 @@ def test_sandoq_no_network_rejects_unapproved_precreate_config(
             registry="168653207203.dkr.ecr.us-east-2.amazonaws.com",
             region="us-east-2",
             pull_through_prefix="pt_dockerio",
+            token_file=Path("/run/secrets/ecr-token"),
         ),
     )
     module.read_token_file = lambda _path: pytest.fail("token read before policy gate")
     module.OCIRunnerAsyncSandboxClient = lambda: constructed.append(True)
     monkeypatch.setitem(sys.modules, "sandoq_provider.oci_client", module)
+    secrets_module = ModuleType("sandoq_provider.secrets")
+    secrets_module.read_secret_file = lambda *_args: "opaque-secret"
+    monkeypatch.setitem(sys.modules, "sandoq_provider.secrets", secrets_module)
 
     with pytest.raises(SandboxError, match="Sandoq no-network requires"):
         sandoq.create_client(
             SandoqConfig(
                 network_access=False,
                 expected_environment="oci-runner-firecracker-tunnel-pull",
+                ecr_token_file=Path("/run/secrets/ecr-token"),
             )
         )
     assert constructed == []
@@ -132,6 +146,12 @@ def test_sandoq_no_network_rejects_unapproved_precreate_config(
 
 def test_sandoq_no_network_accepts_exact_precreate_config(monkeypatch) -> None:
     client = object()
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda _path: SimpleNamespace(st_mode=stat.S_IFREG | 0o600),
+    )
+    monkeypatch.setattr(Path, "is_symlink", lambda _path: False)
     module = ModuleType("sandoq_provider.oci_client")
     module.get_oci_config = lambda: SimpleNamespace(
         environment="oci-runner-firecracker-tunnel-pull",
@@ -151,17 +171,22 @@ def test_sandoq_no_network_accepts_exact_precreate_config(monkeypatch) -> None:
             registry="168653207203.dkr.ecr.us-east-2.amazonaws.com",
             region="us-east-2",
             pull_through_prefix="pt_dockerio",
+            token_file=Path("/run/secrets/ecr-token"),
         ),
     )
     module.read_token_file = lambda path: None
     module.OCIRunnerAsyncSandboxClient = lambda: client
     monkeypatch.setitem(sys.modules, "sandoq_provider.oci_client", module)
+    secrets_module = ModuleType("sandoq_provider.secrets")
+    secrets_module.read_secret_file = lambda *_args: "opaque-secret"
+    monkeypatch.setitem(sys.modules, "sandoq_provider.secrets", secrets_module)
 
     assert (
         sandoq.create_client(
             SandoqConfig(
                 network_access=False,
                 expected_environment="oci-runner-firecracker-tunnel-pull",
+                ecr_token_file=Path("/run/secrets/ecr-token"),
             )
         )
         is client
@@ -251,6 +276,80 @@ async def test_sandoq_runtime_surfaces_unverified_delete(monkeypatch) -> None:
     assert runtime._active is True
 
 
+async def test_sandoq_runtime_rejects_semantically_unverified_delete(
+    monkeypatch,
+) -> None:
+    client = FakeSandoqClient()
+
+    async def unverified_delete(sandbox_id: str):
+        client.deleted.append(sandbox_id)
+        return {"cleanup_verified": False, "poisoned": True}
+
+    client.delete = unverified_delete
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal"))
+    await runtime.start()
+
+    with pytest.raises(SandboxError, match="deletion was not verified"):
+        await runtime.stop()
+    assert runtime._active is False
+    assert client.closed is True
+    await runtime.stop()
+    assert client.deleted == ["assignment-123"]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"poisoned": False, "outer_deletion_verified_http_status": 404},
+        {"cleanup_verified": False, "verified_http_status": 404},
+        {"nested_recycle_verified": True, "status": "release_in_progress"},
+        {"nested_recycle_verified": True, "status": "already_released"},
+        {"nested_recycle_verified": True, "error": "cleanup incomplete"},
+    ],
+)
+async def test_sandoq_runtime_rejects_ambiguous_cleanup_receipts(
+    monkeypatch, response
+) -> None:
+    client = FakeSandoqClient()
+
+    async def ambiguous_delete(_sandbox_id: str):
+        return response
+
+    client.delete = ambiguous_delete
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal"))
+    await runtime.start()
+
+    with pytest.raises(SandboxError, match="deletion was not verified"):
+        await runtime.stop()
+    assert runtime._active is False
+    assert client.closed is True
+
+
+async def test_sandoq_runtime_accepts_poisoned_but_verified_cleanup(
+    monkeypatch,
+) -> None:
+    client = FakeSandoqClient()
+
+    async def poisoned_delete(_sandbox_id: str):
+        return {
+            "status": "poisoned",
+            "poisoned": True,
+            "outer_deletion_verified_http_status": 404,
+            "error": "nested recycle failed before verified outer deletion",
+        }
+
+    client.delete = poisoned_delete
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal"))
+    await runtime.start()
+
+    await runtime.stop()
+    assert runtime._active is False
+    assert client.closed is True
+
+
 async def test_sandoq_runtime_preserves_cleanup_retry_after_provisioning_failure(
     monkeypatch,
 ) -> None:
@@ -306,10 +405,11 @@ async def test_sandoq_runtime_finishes_delete_after_repeated_provisioning_cancel
         waiting.set()
         await asyncio.Event().wait()
 
-    async def delete(sandbox_id: str) -> None:
+    async def delete(sandbox_id: str):
         deleting.set()
         await allow_delete.wait()
         client.deleted.append(sandbox_id)
+        return {"status": "deleted", "verified_http_status": 404}
 
     client.wait_for_creation = wait_for_creation
     client.delete = delete
@@ -339,10 +439,11 @@ async def test_sandoq_runtime_finishes_delete_before_stop_propagates_cancellatio
     deleting = asyncio.Event()
     allow_delete = asyncio.Event()
 
-    async def delete(sandbox_id: str) -> None:
+    async def delete(sandbox_id: str):
         deleting.set()
         await allow_delete.wait()
         client.deleted.append(sandbox_id)
+        return {"status": "deleted", "verified_http_status": 404}
 
     client.delete = delete
     monkeypatch.setattr(sandoq, "create_client", lambda config: client)
@@ -450,6 +551,56 @@ async def test_sandoq_runtime_attributes_native_tunnel_start_failure(
     with pytest.raises(TunnelError, match="failed to start"):
         async with runtime.host_endpoint(4321):
             pytest.fail("an unavailable tunnel must not yield")
+
+
+async def test_sandoq_runtime_waits_for_cancelled_tunnel_start_before_stop(
+    monkeypatch,
+) -> None:
+    start_entered = asyncio.Event()
+    allow_start = threading.Event()
+    events: list[str] = []
+    loop = asyncio.get_running_loop()
+
+    class BlockingRelayTunnel:
+        def __init__(self, _local_port: int, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("start-entered")
+            loop.call_soon_threadsafe(start_entered.set)
+            allow_start.wait()
+            events.append("start-finished")
+
+        def stop(self) -> None:
+            events.append("stop")
+
+    info = SimpleNamespace(
+        environment="oci-runner-firecracker",
+        port_urls={"tunnel": "https://tunnel.example/session"},
+        metadata={"task_network": "host"},
+    )
+    provider = ModuleType("sandoq_provider")
+    provider.registry = SimpleNamespace(get=lambda _sandbox_id: info)
+    tunnel_module = ModuleType("sandoq_provider.tunnel")
+    tunnel_module.SandoqRelayTunnel = BlockingRelayTunnel
+    monkeypatch.setitem(sys.modules, "sandoq_provider", provider)
+    monkeypatch.setitem(sys.modules, "sandoq_provider.tunnel", tunnel_module)
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="sandoq"))
+    runtime._sandbox_id = "assignment-123"
+
+    async def use_tunnel() -> None:
+        async with runtime.host_endpoint(4321):
+            pytest.fail("cancelled tunnel start must not yield")
+
+    running = asyncio.create_task(use_tunnel())
+    await start_entered.wait()
+    running.cancel()
+    await asyncio.sleep(0)
+    assert events == ["start-entered"]
+    allow_start.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert events == ["start-entered", "start-finished", "stop"]
 
 
 async def test_sandoq_runtime_native_tunnel_fails_closed(monkeypatch) -> None:

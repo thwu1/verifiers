@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import shlex
+import stat
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -29,6 +30,28 @@ logger = logging.getLogger(__name__)
 _OCI_BOOTSTRAP_WORKDIR = "/tmp"
 
 
+async def _finish_thread_task(
+    task: asyncio.Task[None],
+) -> tuple[asyncio.CancelledError | None, Exception | None]:
+    """Wait for a thread-backed operation without detaching it on cancellation."""
+    cancelled = None
+    error = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as caught:
+            cancelled = caught
+        except Exception as caught:  # noqa: BLE001 - returned to lifecycle caller
+            error = caught
+            break
+    if error is None:
+        try:
+            task.result()
+        except Exception as caught:  # noqa: BLE001 - returned to lifecycle caller
+            error = caught
+    return cancelled, error
+
+
 class SandoqConfig(BaseConfig):
     type: Literal["sandoq"] = "sandoq"
     image: str = "python:3.11-slim"
@@ -52,6 +75,8 @@ class SandoqConfig(BaseConfig):
     tunnel_ready_timeout: float = Field(30.0, gt=0, le=120)
     expected_environment: str | None = None
     """Exact registry environment required by policy-sensitive callers."""
+    ecr_token_file: Path | None = None
+    """Expected private ECR credential path; contents are never retained."""
 
     @model_validator(mode="after")
     def validate_sandoq_tunnel(self) -> "SandoqConfig":
@@ -79,10 +104,18 @@ def create_client(config: SandoqConfig) -> Any:
                 get_oci_config,
                 read_token_file,
             )
+            from sandoq_provider.secrets import read_secret_file
 
             oci_config = get_oci_config()
             if not config.network_access:
                 expected_environment = "oci-runner-firecracker-tunnel-pull"
+                ecr_token_file = oci_config.ecr.token_file
+                try:
+                    ecr_token_stat = ecr_token_file.lstat()
+                except (AttributeError, OSError) as error:
+                    raise SandboxError(
+                        "Sandoq no-network requires an available ECR token file"
+                    ) from error
                 if (
                     config.expected_environment != expected_environment
                     or oci_config.environment != expected_environment
@@ -92,6 +125,13 @@ def create_client(config: SandoqConfig) -> Any:
                     != "168653207203.dkr.ecr.us-east-2.amazonaws.com"
                     or oci_config.ecr.region != "us-east-2"
                     or oci_config.ecr.pull_through_prefix != "pt_dockerio"
+                    or config.ecr_token_file is None
+                    or not config.ecr_token_file.is_absolute()
+                    or not ecr_token_file.is_absolute()
+                    or ecr_token_file != config.ecr_token_file.expanduser()
+                    or ecr_token_file.is_symlink()
+                    or not stat.S_ISREG(ecr_token_stat.st_mode)
+                    or stat.S_IMODE(ecr_token_stat.st_mode) != 0o600
                     or oci_config.allow_dockerhub_fallback
                     or oci_config.create_deadline_s != 1800
                     or oci_config.pull_timeout_s != 1200
@@ -107,6 +147,7 @@ def create_client(config: SandoqConfig) -> Any:
                         "host task networking, authenticated production ECR pull-through, "
                         "and disabled direct-Docker-Hub fallback"
                     )
+                read_secret_file(ecr_token_file, "ECR token", SandboxError)
             read_token_file(oci_config.token_file)
             return OCIRunnerAsyncSandboxClient()
         from sandoq_provider.client import SandoqAsyncSandboxClient
@@ -235,10 +276,41 @@ class SandoqRuntime(Runtime):
             except Exception:  # provider error is read from the completed task below
                 break
         try:
-            delete_task.result()
+            response = delete_task.result()
         except Exception as error:  # noqa: BLE001 - caller converts provider failures
             return cancelled, error
+        if not isinstance(response, dict):
+            return cancelled, RuntimeError("provider returned no cleanup verification")
+        # A normal provider response consumes and unregisters the assignment,
+        # even when its cleanup receipt is semantically unverified. Retrying the
+        # assignment id would be misinterpreted as an outer-session id.
         self._active = False
+        status = response.get("status")
+        semantic_cleanup_verified = (
+            (status == "deleted" and response.get("verified_http_status") == 404)
+            or (
+                status == "recycled"
+                and response.get("nested_recycle_verified") is True
+                and response.get("poisoned") is not True
+            )
+            or (
+                status == "retired"
+                and response.get("nested_recycle_verified") is True
+                and response.get("outer_deletion_verified_http_status") == 404
+            )
+            or (
+                status == "poisoned"
+                and response.get("poisoned") is True
+                and response.get("outer_deletion_verified_http_status") == 404
+            )
+        )
+        cleanup_verified = (
+            semantic_cleanup_verified
+            and response.get("cleanup_verified", True) is True
+            and (not response.get("error") or status == "poisoned")
+        )
+        if not cleanup_verified:
+            return cancelled, RuntimeError("provider reported unverified cleanup")
         return cancelled, None
 
     async def _run(
@@ -389,33 +461,20 @@ class SandoqRuntime(Runtime):
             ready_timeout=self.config.tunnel_ready_timeout,
         )
         try:
-            try:
-                await asyncio.to_thread(tunnel.start)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
+            start_task = asyncio.create_task(asyncio.to_thread(tunnel.start))
+            start_cancelled, start_error = await _finish_thread_task(start_task)
+            if start_error is not None:
                 raise TunnelError(
-                    f"Sandoq host tunnel failed to start: {type(error).__name__}: {error}"
-                ) from error
+                    "Sandoq host tunnel failed to start: "
+                    f"{type(start_error).__name__}: {start_error}"
+                ) from start_error
+            if start_cancelled is not None:
+                raise start_cancelled
             yield self.config.guest_tunnel_url.rstrip("/")
         finally:
             original_error = sys.exception()
-            cancelled = None
-            cleanup_error = None
             stop_task = asyncio.create_task(asyncio.to_thread(tunnel.stop))
-            while not stop_task.done():
-                try:
-                    await asyncio.shield(stop_task)
-                except asyncio.CancelledError as error:
-                    cancelled = error
-                except Exception as error:  # noqa: BLE001 - handled after cleanup
-                    cleanup_error = error
-                    break
-            if cleanup_error is None:
-                try:
-                    stop_task.result()
-                except Exception as error:  # noqa: BLE001 - preserve the active failure
-                    cleanup_error = error
+            cancelled, cleanup_error = await _finish_thread_task(stop_task)
             if cleanup_error is not None:
                 if original_error is None and cancelled is None:
                     raise TunnelError(
@@ -461,7 +520,7 @@ class SandoqRuntime(Runtime):
             if provider_error is not None
             else None
         )
-        if delete_error is None:
+        if not self._active:
             self._client = None
             with contextlib.suppress(Exception):
                 await client.aclose()
