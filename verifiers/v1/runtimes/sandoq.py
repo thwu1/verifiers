@@ -27,7 +27,6 @@ from verifiers.v1.runtimes.limiters import creation_limiter
 from verifiers.v1.runtimes.modal_tunnel import modal_host_endpoint
 
 logger = logging.getLogger(__name__)
-_OCI_BOOTSTRAP_WORKDIR = "/tmp"
 
 
 async def _finish_thread_task(
@@ -249,7 +248,11 @@ class SandoqRuntime(Runtime):
             network_access=self.config.network_access,
             vm=False,
             timeout_minutes=24 * 60,
-            environment_vars={"OCI_EXPECTED_WORKDIR": _OCI_BOOTSTRAP_WORKDIR}
+            # The authoritative OCI provider validates this directory before it
+            # exposes Bash.  Passing a generic bootstrap directory and creating
+            # the task workdir afterwards would bypass the image/workdir
+            # integrity check and could run a task in an empty directory.
+            environment_vars={"OCI_EXPECTED_WORKDIR": self.config.workdir}
             if self.config.mode == "oci-runner"
             else None,
         )
@@ -262,16 +265,15 @@ class SandoqRuntime(Runtime):
                 self._sandbox_id = str(sandbox.id)
                 self._active = True
                 await client.wait_for_creation(self._sandbox_id)
-            result = await self._run(
-                client,
-                ["mkdir", "-p", self.config.workdir],
-                {},
-                working_dir=_OCI_BOOTSTRAP_WORKDIR
-                if self.config.mode == "oci-runner"
-                else "/",
-            )
-            if result.exit_code != 0:
-                raise RuntimeError(result.stderr or result.stdout)
+            if self.config.mode == "environment":
+                result = await self._run(
+                    client,
+                    ["mkdir", "-p", self.config.workdir],
+                    {},
+                    working_dir="/",
+                )
+                if result.exit_code != 0:
+                    raise RuntimeError(result.stderr or result.stdout)
         except asyncio.CancelledError:
             _, delete_error = await self._delete_active(client)
             if delete_error is not None:
