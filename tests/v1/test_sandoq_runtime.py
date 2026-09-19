@@ -90,7 +90,7 @@ class FakeSandoqClient:
     ("environment", "task_network"),
     [
         ("oci-runner-firecracker", "host"),
-        ("oci-runner-firecracker-small", "host"),
+        ("oci-runner-firecracker-small", "none"),
         ("oci-runner-firecracker-tunnel-pull", "none"),
     ],
 )
@@ -133,11 +133,12 @@ def test_sandoq_no_network_rejects_unapproved_precreate_config(
     secrets_module.read_secret_file = lambda *_args: "opaque-secret"
     monkeypatch.setitem(sys.modules, "sandoq_provider.secrets", secrets_module)
 
-    with pytest.raises(SandboxError, match="Sandoq no-network requires"):
+    with pytest.raises(SandboxError, match="Sandoq"):
         sandoq.create_client(
             SandoqConfig(
                 network_access=False,
-                expected_environment="oci-runner-firecracker-tunnel-pull",
+                host_tunnel="none",
+                expected_environment="oci-runner-firecracker",
                 ecr_token_file=Path("/run/secrets/ecr-token"),
             )
         )
@@ -154,8 +155,8 @@ def test_sandoq_no_network_accepts_exact_precreate_config(monkeypatch) -> None:
     monkeypatch.setattr(Path, "is_symlink", lambda _path: False)
     module = ModuleType("sandoq_provider.oci_client")
     module.get_oci_config = lambda: SimpleNamespace(
-        environment="oci-runner-firecracker-tunnel-pull",
-        task_network="host",
+        environment="oci-runner-firecracker",
+        task_network="none",
         token_file=Path("/opaque/token"),
         allow_dockerhub_fallback=False,
         create_deadline_s=1800,
@@ -185,7 +186,8 @@ def test_sandoq_no_network_accepts_exact_precreate_config(monkeypatch) -> None:
         sandoq.create_client(
             SandoqConfig(
                 network_access=False,
-                expected_environment="oci-runner-firecracker-tunnel-pull",
+                host_tunnel="none",
+                expected_environment="oci-runner-firecracker",
                 ecr_token_file=Path("/run/secrets/ecr-token"),
             )
         )
@@ -244,6 +246,75 @@ async def test_sandoq_runtime_lifecycle(monkeypatch) -> None:
     await runtime.stop()
     assert client.deleted == ["assignment-123"]
     assert client.closed is True
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"mode": "environment"},
+        {"network_access": True},
+        {"expected_environment": None},
+        {"expected_environment": "oci-runner-firecracker-small"},
+        {"ecr_token_file": None},
+        {"ecr_token_file": Path("relative-token")},
+    ],
+)
+def test_sandoq_host_side_config_rejects_incomplete_policy(updates) -> None:
+    values = {
+        "mode": "oci-runner",
+        "network_access": False,
+        "host_tunnel": "none",
+        "expected_environment": "oci-runner-firecracker",
+        "ecr_token_file": Path("/run/secrets/ecr-token"),
+        **updates,
+    }
+
+    with pytest.raises(ValueError, match="Sandoq host-side execution"):
+        SandoqConfig(**values)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"mode": "environment"},
+        {"network_access": True},
+        {"expected_environment": None},
+        {"expected_environment": "oci-runner-firecracker-small"},
+        {"ecr_token_file": None},
+        {"ecr_token_file": Path("relative-token")},
+    ],
+)
+def test_sandoq_create_client_rechecks_host_policy_after_unvalidated_copy(
+    updates,
+) -> None:
+    values = {
+        "type": "sandoq",
+        "mode": "oci-runner",
+        "network_access": False,
+        "host_tunnel": "none",
+        "expected_environment": "oci-runner-firecracker",
+        "ecr_token_file": Path("/run/secrets/ecr-token"),
+        **updates,
+    }
+    config = SandoqConfig.model_construct(**values)
+
+    with pytest.raises(SandboxError, match="host-side no-network configuration"):
+        sandoq.create_client(config)
+
+
+async def test_sandoq_no_tunnel_mode_rejects_host_endpoint_calls() -> None:
+    runtime = SandoqRuntime(
+        SandoqConfig(
+            network_access=False,
+            host_tunnel="none",
+            expected_environment="oci-runner-firecracker",
+            ecr_token_file=Path("/run/secrets/ecr-token"),
+        )
+    )
+
+    with pytest.raises(SandboxError, match="must not be called"):
+        async with runtime.host_endpoint(4321):
+            pass
 
 
 async def test_sandoq_runtime_ignores_close_error_after_verified_delete(

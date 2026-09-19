@@ -67,7 +67,7 @@ class SandoqConfig(BaseConfig):
     disk: float = 5.0
     creates_per_sec: float | None = None
     """Optional process-wide creation pacing; the OCI runner also applies its own pool limits."""
-    host_tunnel: Literal["sandoq", "modal", "prime"] = "modal"
+    host_tunnel: Literal["none", "sandoq", "modal", "prime"] = "modal"
     """How a sandbox reaches host interception services."""
     guest_tunnel_url: str = "http://127.0.0.1:8485"
     """Loopback endpoint exposed by the Sandoq Firecracker environment."""
@@ -92,11 +92,46 @@ class SandoqConfig(BaseConfig):
             raise ValueError(
                 "guest_tunnel_url must be an explicit HTTP loopback URL with a port"
             )
+        if self.mode == "oci-runner" and self.host_tunnel == "none":
+            if (
+                self.network_access is not False
+                or self.expected_environment != "oci-runner-firecracker"
+                or self.ecr_token_file is None
+                or not self.ecr_token_file.is_absolute()
+            ):
+                raise ValueError(
+                    "Sandoq host-side execution requires network_access=false, the "
+                    "production Firecracker environment, and an absolute ECR token path"
+                )
+        elif self.mode == "oci-runner" and not self.network_access:
+            raise ValueError(
+                "Sandoq OCI no-network execution requires a host-side harness and no host tunnel"
+            )
+        if self.host_tunnel == "none" and self.mode != "oci-runner":
+            raise ValueError(
+                "Sandoq host-side execution is supported only by OCI runner mode"
+            )
         return self
 
 
 def create_client(config: SandoqConfig) -> Any:
     """Construct the PR-pinned provider lazily so other runtimes need no internal dependency."""
+    if config.host_tunnel == "none" and (
+        config.mode != "oci-runner"
+        or config.network_access is not False
+        or config.expected_environment != "oci-runner-firecracker"
+        or config.ecr_token_file is None
+        or not config.ecr_token_file.is_absolute()
+    ):
+        raise SandboxError("Sandoq host-side no-network configuration is incomplete")
+    if (
+        config.mode == "oci-runner"
+        and not config.network_access
+        and config.host_tunnel != "none"
+    ):
+        raise SandboxError(
+            "Sandoq OCI no-network execution requires a host-side harness and no host tunnel"
+        )
     try:
         if config.mode == "oci-runner":
             from sandoq_provider.oci_client import (
@@ -107,8 +142,16 @@ def create_client(config: SandoqConfig) -> Any:
             from sandoq_provider.secrets import read_secret_file
 
             oci_config = get_oci_config()
+            if config.host_tunnel == "none" and oci_config.task_network != "none":
+                raise SandboxError(
+                    "Sandoq host-side harnesses require nested task networking to be disabled"
+                )
+            if config.host_tunnel == "sandoq" and oci_config.task_network != "host":
+                raise SandboxError(
+                    "Sandoq native reverse tunnels require nested host networking"
+                )
             if not config.network_access:
-                expected_environment = "oci-runner-firecracker-tunnel-pull"
+                expected_environment = "oci-runner-firecracker"
                 ecr_token_file = oci_config.ecr.token_file
                 try:
                     ecr_token_stat = ecr_token_file.lstat()
@@ -119,7 +162,8 @@ def create_client(config: SandoqConfig) -> Any:
                 if (
                     config.expected_environment != expected_environment
                     or oci_config.environment != expected_environment
-                    or oci_config.task_network != "host"
+                    or config.host_tunnel != "none"
+                    or oci_config.task_network != "none"
                     or not oci_config.ecr.enabled
                     or oci_config.ecr.registry
                     != "168653207203.dkr.ecr.us-east-2.amazonaws.com"
@@ -143,9 +187,10 @@ def create_client(config: SandoqConfig) -> Any:
                     or not oci_config.session_reuse
                 ):
                     raise SandboxError(
-                        "Sandoq no-network requires the exact tunnel-pull environment, "
-                        "host task networking, authenticated production ECR pull-through, "
-                        "and disabled direct-Docker-Hub fallback"
+                        "Sandoq no-network requires a host-side harness, the production "
+                        "Firecracker environment, disabled nested task networking, "
+                        "authenticated production ECR pull-through, and disabled "
+                        "direct-Docker-Hub fallback"
                     )
                 read_secret_file(ecr_token_file, "ECR token", SandboxError)
             read_token_file(oci_config.token_file)
@@ -411,6 +456,10 @@ class SandoqRuntime(Runtime):
 
     @contextlib.asynccontextmanager
     async def host_endpoint(self, port: int):
+        if self.config.host_tunnel == "none":
+            raise SandboxError(
+                "host_endpoint must not be called for a host-side Sandoq harness"
+            )
         if self.config.host_tunnel == "prime":
             async with shared_host_endpoint(port, is_local=False) as url:
                 yield url
