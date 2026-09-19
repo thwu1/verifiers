@@ -1,18 +1,22 @@
+import asyncio
 import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
-
 from verifiers.v1 import graph
 from verifiers.v1.clients import RolloutContext
 from verifiers.v1.clients.client import RelayReply
 from verifiers.v1.errors import (
     HarnessError,
     InterceptionError,
+    OverlongPromptError,
     ProviderError,
     UserError,
 )
 from verifiers.v1.interception import InterceptionServer, RolloutSession
+from verifiers.v1.interception.pool import InterceptionPool, PooledServer
 from verifiers.v1.retries import RolloutRetryConfig, should_retry
 from verifiers.v1.task import Task
 from verifiers.v1.trace import Trace
@@ -96,6 +100,7 @@ def _server_and_session(
     )
     server = InterceptionServer()
     server.sessions["secret"] = session
+    server._requests["secret"] = set()
     return server, session
 
 
@@ -355,6 +360,52 @@ class CloseFailingClient:
 
 
 @pytest.mark.asyncio
+async def test_closed_session_ignores_late_stream_completion(monkeypatch):
+    started = asyncio.Event()
+
+    class CancellationResistantClient:
+        async def relay(self, *args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass
+
+            async def chunks():
+                yield b'data: {"chunk":true}\n\n'
+
+            async def close():
+                pass
+
+            return RelayReply(
+                content_type="text/event-stream",
+                chunks=chunks(),
+                close=close,
+            )
+
+    class StreamingDialect(StreamDialect):
+        @staticmethod
+        def streaming(body: dict) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        "verifiers.v1.interception.server.web.StreamResponse",
+        StreamResponse,
+    )
+    server, session = _server_and_session(CancellationResistantClient())
+    request = asyncio.create_task(server._handler_for(StreamingDialect())(Request()))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await server.unregister("secret")
+    await asyncio.wait_for(request, timeout=1)
+
+    assert session.closed is True
+    assert session.error is None
+    assert session.trace.stop_condition is None
+    assert session.trace.num_turns == 0
+
+
+@pytest.mark.asyncio
 async def test_stream_finalize_failure_is_stored_as_provider_error(monkeypatch):
     monkeypatch.setattr(
         "verifiers.v1.interception.server.web.StreamResponse", StreamResponse
@@ -553,3 +604,234 @@ async def test_handler_fallback_stores_interception_error(monkeypatch):
     assert _response_error(response).startswith(
         "interception request failed: RuntimeError:"
     )
+
+
+@pytest.mark.asyncio
+async def test_unregister_cancels_and_drains_admitted_request_without_late_commit():
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class CancellationResistantClient:
+        async def get_response(self, *args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                return Response(
+                    id="late-response",
+                    created=0,
+                    model="model",
+                    message=AssistantMessage(content="late"),
+                    finish_reason="stop",
+                )
+
+    server, session = _server_and_session(CancellationResistantClient())
+    request = asyncio.create_task(server._handler_for(Dialect())(Request()))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await server.unregister("secret")
+    response = await asyncio.wait_for(request, timeout=1)
+
+    assert cancelled.is_set()
+    assert response.status == 502
+    assert session.closed is True
+    assert session.trace.num_turns == 0
+    assert "secret" not in server.sessions
+    assert "secret" not in server._requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "late_error",
+    [OverlongPromptError("late overlong"), ProviderError("late provider failure")],
+)
+async def test_closed_session_ignores_late_nonstream_failure(late_error):
+    started = asyncio.Event()
+
+    class CancellationResistantClient:
+        async def get_response(self, *args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise late_error
+
+    server, session = _server_and_session(CancellationResistantClient())
+    request = asyncio.create_task(server._handler_for(Dialect())(Request()))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await server.unregister("secret")
+    await asyncio.wait_for(request, timeout=1)
+
+    assert session.closed is True
+    assert session.error is None
+    assert session.trace.stop_condition is None
+    assert session.trace.num_turns == 0
+
+
+@pytest.mark.asyncio
+async def test_closed_session_ignores_late_aux_failure():
+    started = asyncio.Event()
+
+    class CancellationResistantClient:
+        async def relay_aux(self, *args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise ProviderError("late auxiliary failure")
+
+    server, session = _server_and_session(CancellationResistantClient())
+    request = asyncio.create_task(
+        server._aux_handler_for(Dialect(), "/v1/count_tokens")(Request())
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await server.unregister("secret")
+    await asyncio.wait_for(request, timeout=1)
+
+    assert session.closed is True
+    assert session.error is None
+    assert session.trace.stop_condition is None
+
+
+@pytest.mark.asyncio
+async def test_closed_session_ignores_late_stop_result():
+    started = asyncio.Event()
+
+    async def cancellation_resistant_stop(trace) -> bool:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return True
+
+    server, session = _server_and_session(UnusedClient())
+    session.stops = [cancellation_resistant_stop]
+    request = asyncio.create_task(server._handler_for(Dialect())(Request()))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await server.unregister("secret")
+    await asyncio.wait_for(request, timeout=1)
+
+    assert session.closed is True
+    assert session.error is None
+    assert session.trace.stop_condition is None
+
+
+@pytest.mark.asyncio
+async def test_pool_teardown_preserves_external_cancellation_when_drain_fails():
+    entered = asyncio.Event()
+    unregister_called = asyncio.Event()
+
+    class Server:
+        port = 1
+
+        def register(self, session) -> str:
+            return "secret"
+
+        async def unregister(self, secret: str) -> None:
+            unregister_called.set()
+            raise InterceptionError("request drain failed")
+
+    entry = PooledServer(Server(), "http://127.0.0.1:1", load=0)
+    pool = object.__new__(InterceptionPool)
+    pool._lock = asyncio.Lock()
+
+    async def get_entry():
+        return entry
+
+    pool._entry = get_entry
+
+    async def use_slot() -> None:
+        async with pool.acquire(SimpleNamespace(), SimpleNamespace()):
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(use_slot())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert unregister_called.is_set()
+    assert entry.load == 0
+    assert entry.healthy is False
+
+
+@pytest.mark.asyncio
+async def test_pool_excludes_entry_while_failed_unregister_is_draining(monkeypatch):
+    unregister_started = asyncio.Event()
+    fail_unregister = asyncio.Event()
+    first_entered = asyncio.Event()
+    leave_first = asyncio.Event()
+
+    class FailingServer:
+        port = 1
+
+        def register(self, session) -> str:
+            return "first-secret"
+
+        async def unregister(self, secret: str) -> None:
+            unregister_started.set()
+            await fail_unregister.wait()
+            raise InterceptionError("request drain failed")
+
+    class FreshServer:
+        port = 2
+
+        def register(self, session) -> str:
+            return "fresh-secret"
+
+        async def unregister(self, secret: str) -> None:
+            pass
+
+    class Stack:
+        async def enter_async_context(self, value):
+            return value
+
+    first_server = FailingServer()
+    fresh_server = FreshServer()
+    entry = PooledServer(first_server, "http://127.0.0.1:1")
+    pool = object.__new__(InterceptionPool)
+    pool.runtime_type = "test"
+    pool.is_local = True
+    pool.instance_host_endpoint = True
+    pool.multiplex = 2
+    pool._servers = [entry]
+    pool._lock = asyncio.Lock()
+    pool._stack = Stack()
+    monkeypatch.setattr(
+        "verifiers.v1.interception.pool.InterceptionServer",
+        lambda: fresh_server,
+    )
+
+    class Runtime:
+        @asynccontextmanager
+        async def host_endpoint(self, port: int):
+            yield f"http://127.0.0.1:{port}"
+
+    runtime = Runtime()
+
+    async def first_slot() -> None:
+        async with pool.acquire(SimpleNamespace(), runtime):
+            first_entered.set()
+            await leave_first.wait()
+
+    first = asyncio.create_task(first_slot())
+    await asyncio.wait_for(first_entered.wait(), timeout=1)
+    leave_first.set()
+    await asyncio.wait_for(unregister_started.wait(), timeout=1)
+
+    assert entry.draining == 1
+    async with pool.acquire(SimpleNamespace(), runtime) as acquired:
+        assert acquired[1] == "fresh-secret"
+        assert len(pool._servers) == 2
+
+    fail_unregister.set()
+    with pytest.raises(InterceptionError, match="request drain failed"):
+        await first
+    assert entry.healthy is False
+    assert entry.draining == 0
+    assert entry.load == 0
