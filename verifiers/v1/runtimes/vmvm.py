@@ -146,7 +146,9 @@ def shell_command(argv: list[str], env: dict[str, str], workdir: str) -> str:
     """Render one argv invocation for the backend's persistent Bash session."""
     command = shlex.join(argv)
     if env:
-        assignments = " ".join(shlex.quote(f"{key}={value}") for key, value in env.items())
+        assignments = " ".join(
+            shlex.quote(f"{key}={value}") for key, value in env.items()
+        )
         command = f"env {assignments} {command}"
     return f"cd {shlex.quote(workdir)} && {command}"
 
@@ -310,7 +312,10 @@ class VMVMRuntime(Runtime):
                     backend = available_backend
                     available_backend = None
                 provisioning_cancel_event.set()
-                deadline = asyncio.get_running_loop().time() + COMMAND_CANCELLATION_GRACE_SECONDS
+                deadline = (
+                    asyncio.get_running_loop().time()
+                    + COMMAND_CANCELLATION_GRACE_SECONDS
+                )
                 if backend is not None:
                     self._backend = backend
                     try:
@@ -325,7 +330,9 @@ class VMVMRuntime(Runtime):
                     raise cancellation
                 remaining = deadline - asyncio.get_running_loop().time()
                 try:
-                    await asyncio.wait_for(asyncio.shield(create_worker), timeout=remaining)
+                    await asyncio.wait_for(
+                        asyncio.shield(create_worker), timeout=remaining
+                    )
                 except BaseException as error:
                     self._cancellation_error = SandboxError(
                         "VMVM provisioning cancellation exceeded the cancellation grace"
@@ -337,9 +344,9 @@ class VMVMRuntime(Runtime):
             self._backend = backend
             mkdir_worker = self._start_backend_call(
                 "provision-command",
-                backend.run_bash,
+                self._run_command,
+                backend,
                 f"mkdir -p {shlex.quote(self.config.workdir)}",
-                self.config.session_timeout,
             )
             try:
                 result = await asyncio.shield(mkdir_worker)
@@ -369,7 +376,9 @@ class VMVMRuntime(Runtime):
         info = backend.get_debugging_info()
         container_id = info.get("container_id")
         self._descriptor = str(container_id) if container_id is not None else self.name
-        logger.info("vmvm: container %s up (image=%s)", self._descriptor, self.config.image)
+        logger.info(
+            "vmvm: container %s up (image=%s)", self._descriptor, self.config.image
+        )
 
     async def _cancel_command(
         self,
@@ -452,7 +461,9 @@ class VMVMRuntime(Runtime):
                 remaining = deadline - loop.time()
                 if remaining > 0:
                     try:
-                        await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
+                        await asyncio.wait_for(
+                            asyncio.shield(worker), timeout=remaining
+                        )
                     except TimeoutError:
                         pass
                     except BaseException as error:
@@ -464,7 +475,9 @@ class VMVMRuntime(Runtime):
                     first_error = first_error or error
         if any(not worker.done() for worker in all_workers):
             self._track_quarantine(self._finish_quarantine(backend, all_workers))
-            raise SandboxError(f"{message}; teardown workers exceeded the cancellation grace") from first_error
+            raise SandboxError(
+                f"{message}; teardown workers exceeded the cancellation grace"
+            ) from first_error
 
         # A non-command backend operation may create a resource after the first
         # destroy passed that resource's cleanup site.  Once every data worker is
@@ -480,7 +493,9 @@ class VMVMRuntime(Runtime):
                 first_error = first_error or error
         if not final_destroy.done():
             self._track_quarantine(self._finish_quarantine(backend, (final_destroy,)))
-            raise SandboxError(f"{message}; final teardown exceeded the cancellation grace") from first_error
+            raise SandboxError(
+                f"{message}; final teardown exceeded the cancellation grace"
+            ) from first_error
         if not final_destroy.cancelled():
             try:
                 final_destroy.result()
@@ -504,7 +519,9 @@ class VMVMRuntime(Runtime):
         try:
             return await asyncio.shield(worker)
         except asyncio.CancelledError as error:
-            deadline = asyncio.get_running_loop().time() + COMMAND_CANCELLATION_GRACE_SECONDS
+            deadline = (
+                asyncio.get_running_loop().time() + COMMAND_CANCELLATION_GRACE_SECONDS
+            )
             try:
                 await self._destroy_and_drain(
                     backend,
@@ -537,7 +554,9 @@ class VMVMRuntime(Runtime):
         command = shell_command(argv, env, self.config.workdir)
         async with self._run_lock:
             backend = self.backend
-            worker = self._start_backend_call("command", self._run_command, backend, command)
+            worker = self._start_backend_call(
+                "command", self._run_command, backend, command
+            )
             try:
                 result = await asyncio.shield(worker)
             except asyncio.CancelledError:
@@ -549,14 +568,22 @@ class VMVMRuntime(Runtime):
             except Exception as error:
                 raise SandboxError(f"VMVM exec failed: {error}") from error
         if result["exit_code"] < 0:
-            raise SandboxError(f"VMVM exec failed ({result['error_type']}): {result['output']}")
-        return ProgramResult(exit_code=result["exit_code"], stdout=result["output"], stderr="")
+            raise SandboxError(
+                f"VMVM exec failed ({result['error_type']}): {result['output']}"
+            )
+        return ProgramResult(
+            exit_code=result["exit_code"], stdout=result["output"], stderr=""
+        )
 
-    async def run_background(self, argv: list[str], env: dict[str, str], log: str) -> None:
+    async def run_background(
+        self, argv: list[str], env: dict[str, str], log: str
+    ) -> None:
         inner = f"nohup {shlex.join(argv)} > {shlex.quote(log)} 2>&1 < /dev/null &"
         result = await self.run(["sh", "-c", inner], env)
         if result.exit_code != 0:
-            raise SandboxError(f"VMVM background launch failed: {result.stdout.strip()}")
+            raise SandboxError(
+                f"VMVM background launch failed: {result.stdout.strip()}"
+            )
 
     async def configure_network_policy(
         self,
@@ -566,7 +593,9 @@ class VMVMRuntime(Runtime):
         if mode == self._network_mode:
             return
         if self._network_mode == "no-network":
-            raise SandboxError("VMVM cannot relax an active no-network policy back to public")
+            raise SandboxError(
+                "VMVM cannot relax an active no-network policy back to public"
+            )
         try:
             async with self._run_lock:
                 await self._call_backend(
@@ -574,7 +603,9 @@ class VMVMRuntime(Runtime):
                     self.backend.prepare_network_isolation,
                 )
         except Exception as error:
-            raise SandboxError(f"VMVM network-isolation preparation failed: {error}") from error
+            raise SandboxError(
+                f"VMVM network-isolation preparation failed: {error}"
+            ) from error
         self._network_mode = "no-network"
 
     def defer_until_network_isolated(
@@ -599,7 +630,9 @@ class VMVMRuntime(Runtime):
                             self.backend.activate_network_isolation,
                         )
                 except Exception as error:
-                    raise SandboxError(f"VMVM network-isolation activation failed: {error}") from error
+                    raise SandboxError(
+                        f"VMVM network-isolation activation failed: {error}"
+                    ) from error
                 self._network_active = True
             commands, self._deferred_network_commands = (
                 self._deferred_network_commands,
@@ -608,7 +641,9 @@ class VMVMRuntime(Runtime):
             for argv, env in commands:
                 result = await self.run(argv, env)
                 if result.exit_code != 0:
-                    raise SandboxError(f"VMVM deferred isolated startup failed: {result.stdout[-2000:]}")
+                    raise SandboxError(
+                        f"VMVM deferred isolated startup failed: {result.stdout[-2000:]}"
+                    )
 
     async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
         await self.activate_network_policy()
@@ -624,7 +659,9 @@ class VMVMRuntime(Runtime):
         target = self.absolute_path(path)
         try:
             async with self._run_lock:
-                return await self._call_backend("file read", self.backend.read_file, target)
+                return await self._call_backend(
+                    "file read", self.backend.read_file, target
+                )
         except Exception as error:
             raise SandboxError(f"read {path!r}: {error}") from error
 
@@ -632,7 +669,9 @@ class VMVMRuntime(Runtime):
         target = self.absolute_path(path)
         try:
             async with self._run_lock:
-                await self._call_backend("file write", self.backend.transfer_file, data, target)
+                await self._call_backend(
+                    "file write", self.backend.transfer_file, data, target
+                )
         except Exception as error:
             raise SandboxError(f"write {path!r}: {error}") from error
 
@@ -661,8 +700,12 @@ class VMVMRuntime(Runtime):
         except Exception as error:
             raise SandboxError(f"VMVM root command failed: {error}") from error
         if result["exit_code"] < 0:
-            raise SandboxError(f"VMVM root command failed ({result['error_type']}): {result['output']}")
-        return ProgramResult(exit_code=result["exit_code"], stdout=result["output"], stderr="")
+            raise SandboxError(
+                f"VMVM root command failed ({result['error_type']}): {result['output']}"
+            )
+        return ProgramResult(
+            exit_code=result["exit_code"], stdout=result["output"], stderr=""
+        )
 
     async def run_service(
         self,
@@ -689,8 +732,12 @@ class VMVMRuntime(Runtime):
         except Exception as error:
             raise SandboxError(f"VMVM service exec failed: {error}") from error
         if result["exit_code"] < 0:
-            raise SandboxError(f"VMVM service exec failed ({result['error_type']}): {result['output']}")
-        return ProgramResult(exit_code=result["exit_code"], stdout=result["output"], stderr="")
+            raise SandboxError(
+                f"VMVM service exec failed ({result['error_type']}): {result['output']}"
+            )
+        return ProgramResult(
+            exit_code=result["exit_code"], stdout=result["output"], stderr=""
+        )
 
     async def read_service(self, service: str, path: str) -> bytes:
         if service in ("", "main"):
@@ -704,7 +751,9 @@ class VMVMRuntime(Runtime):
                     path,
                 )
         except Exception as error:
-            raise SandboxError(f"read {path!r} from service {service!r}: {error}") from error
+            raise SandboxError(
+                f"read {path!r} from service {service!r}: {error}"
+            ) from error
 
     async def host_endpoint_is_reachable(self, url: str) -> bool:
         """Check the workload-to-host HTTP path without consulting proxy settings."""
@@ -718,7 +767,9 @@ class VMVMRuntime(Runtime):
             "s.sendall(b'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'); "
             "data=s.recv(16); s.close(); assert data.startswith(b'HTTP/')"
         )
-        shell_probe = shlex.quote("printf 'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'")
+        shell_probe = shlex.quote(
+            "printf 'GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n'"
+        )
         probe_url = shlex.quote(f"http://{endpoint.hostname}:{endpoint.port}/")
         probe = (
             "if command -v python3 >/dev/null 2>&1; then "
@@ -756,7 +807,9 @@ class VMVMRuntime(Runtime):
         try:
             await self.activate_network_policy()
             if self._network_active and not await self.host_endpoint_is_reachable(url):
-                raise TunnelError("VMVM host tunnel was unreachable after no-network activation")
+                raise TunnelError(
+                    "VMVM host tunnel was unreachable after no-network activation"
+                )
             try:
                 yield url
             except Exception as body_error:
@@ -765,7 +818,9 @@ class VMVMRuntime(Runtime):
                 except Exception:
                     reachable = False
                 if not reachable:
-                    raise TunnelError("VMVM host tunnel became unreachable during the rollout") from body_error
+                    raise TunnelError(
+                        "VMVM host tunnel became unreachable during the rollout"
+                    ) from body_error
                 raise
         finally:
             if self._backend is not None:
@@ -780,7 +835,9 @@ class VMVMRuntime(Runtime):
         """Destroy the backend without depending on command-executor capacity."""
         async with self._run_lock:
             loop = asyncio.get_running_loop()
-            deadline = self._quarantine_deadline or (loop.time() + COMMAND_CANCELLATION_GRACE_SECONDS)
+            deadline = self._quarantine_deadline or (
+                loop.time() + COMMAND_CANCELLATION_GRACE_SECONDS
+            )
             cancellation: asyncio.CancelledError | None = None
             teardown_error: BaseException | None = None
 
@@ -789,12 +846,18 @@ class VMVMRuntime(Runtime):
                 while not worker.done():
                     remaining = deadline - loop.time()
                     if remaining <= 0:
-                        teardown_error = teardown_error or SandboxError("VMVM teardown exceeded the cancellation grace")
+                        teardown_error = teardown_error or SandboxError(
+                            "VMVM teardown exceeded the cancellation grace"
+                        )
                         return
                     try:
-                        await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
+                        await asyncio.wait_for(
+                            asyncio.shield(worker), timeout=remaining
+                        )
                     except TimeoutError as error:
-                        teardown_error = teardown_error or SandboxError("VMVM teardown exceeded the cancellation grace")
+                        teardown_error = teardown_error or SandboxError(
+                            "VMVM teardown exceeded the cancellation grace"
+                        )
                         teardown_error.__cause__ = error
                         return
                     except asyncio.CancelledError as error:
@@ -814,7 +877,9 @@ class VMVMRuntime(Runtime):
                     if task.done():
                         self._quarantine_tasks.discard(task)
             if self._quarantine_tasks:
-                teardown_error = teardown_error or SandboxError("VMVM teardown exceeded the cancellation grace")
+                teardown_error = teardown_error or SandboxError(
+                    "VMVM teardown exceeded the cancellation grace"
+                )
 
             backend, self._backend = self._backend, None
             if backend is not None:
@@ -826,7 +891,9 @@ class VMVMRuntime(Runtime):
                     self._quarantine_deadline = None
                 elif not destroy_worker.done():
                     self._quarantine_deadline = deadline
-                    self._track_quarantine(self._finish_quarantine(backend, (destroy_worker,)))
+                    self._track_quarantine(
+                        self._finish_quarantine(backend, (destroy_worker,))
+                    )
 
             if cancellation is not None:
                 raise cancellation

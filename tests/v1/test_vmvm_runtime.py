@@ -48,10 +48,14 @@ class FakeBackend:
             if result["exit_code"] >= 0 or result["error_type"] != "broken_pipe":
                 break
             if not self.restart_session():
-                raise RuntimeError("VMVM reconnect failed: sandbox state is unavailable")
+                raise RuntimeError(
+                    "VMVM reconnect failed: sandbox state is unavailable"
+                )
             recovered = self.recover_last()
             if recovered is None:
-                raise RuntimeError("VMVM command recovery failed: exact-once execution cannot be proven")
+                raise RuntimeError(
+                    "VMVM command recovery failed: exact-once execution cannot be proven"
+                )
             result = recovered
         return result
 
@@ -66,7 +70,9 @@ class FakeBackend:
         return self.recovery_results.pop(0)
 
     def transfer_file(self, file_content: str | bytes, remote_path: str) -> None:
-        self.files[remote_path] = file_content.encode() if isinstance(file_content, str) else file_content
+        self.files[remote_path] = (
+            file_content.encode() if isinstance(file_content, str) else file_content
+        )
 
     def read_file(self, remote_path: str) -> bytes:
         return self.files[remote_path]
@@ -115,7 +121,9 @@ class FakeBackend:
 
 async def test_vmvm_runtime_lifecycle(monkeypatch) -> None:
     backend = FakeBackend()
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     config = VMVMConfig(
         image="swebench/image",
         workdir="/testbed",
@@ -129,7 +137,9 @@ async def test_vmvm_runtime_lifecycle(monkeypatch) -> None:
     await runtime.start()
     assert runtime.descriptor == "abc123"
 
-    result = await runtime.run(["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"})
+    result = await runtime.run(
+        ["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"}
+    )
     assert result.exit_code == 0
     assert result.stdout == "ok"
     assert backend.commands == [
@@ -153,7 +163,66 @@ async def test_vmvm_runtime_lifecycle(monkeypatch) -> None:
     assert backend.destroyed is True
 
 
-async def test_vmvm_runtime_cancellation_joins_command_before_reuse(monkeypatch) -> None:
+async def test_vmvm_runtime_recovers_initial_workdir_command_exactly_once(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+    backend.result = {
+        "status": "error",
+        "output": "connection dropped",
+        "error_type": "broken_pipe",
+        "exit_code": -1,
+    }
+    backend.recovery_results = [
+        {
+            "status": "success",
+            "output": "created once",
+            "error_type": "none",
+            "exit_code": 0,
+        }
+    ]
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
+    runtime = VMVMRuntime(VMVMConfig(workdir="/testbed", session_timeout=10))
+
+    await runtime.start()
+
+    assert backend.restart_calls == 1
+    assert backend.commands.count(("mkdir -p /testbed", 10)) == 1
+    await runtime.stop()
+
+
+async def test_vmvm_runtime_bounds_initial_workdir_recovery_and_cleans_up(
+    monkeypatch,
+) -> None:
+    backend = FakeBackend()
+    dropped: vmvm.VMVMBashResult = {
+        "status": "error",
+        "output": "connection dropped",
+        "error_type": "broken_pipe",
+        "exit_code": -1,
+    }
+    backend.result = dropped
+    backend.recovery_results = [dropped] * vmvm.MAX_TRANSPORT_RECOVERY_ATTEMPTS
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
+    runtime = VMVMRuntime(VMVMConfig(workdir="/testbed", session_timeout=10))
+
+    with pytest.raises(SandboxError, match="transport remained unavailable"):
+        await runtime.start()
+
+    assert backend.restart_calls == vmvm.MAX_TRANSPORT_RECOVERY_ATTEMPTS
+    assert backend.commands.count(("mkdir -p /testbed", 10)) == 1
+    assert backend.destroyed is True
+    with pytest.raises(RuntimeError, match="not running"):
+        _ = runtime.backend
+
+
+async def test_vmvm_runtime_cancellation_joins_command_before_reuse(
+    monkeypatch,
+) -> None:
     backend = FakeBackend()
     started = threading.Event()
     release = threading.Event()
@@ -182,7 +251,9 @@ async def test_vmvm_runtime_cancellation_joins_command_before_reuse(monkeypatch)
 
     backend.run_bash = run_bash
     backend.cancel_active_command = cancel_active_command
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 1.0)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
@@ -230,7 +301,9 @@ async def test_vmvm_runtime_cancellation_during_transport_recovery_joins_before_
 
     backend.recover_last = recover_last
     backend.cancel_active_command = cancel_active_command
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 1.0)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
@@ -261,7 +334,9 @@ async def test_vmvm_runtime_cancellation_during_transport_recovery_joins_before_
     await runtime.stop()
 
 
-async def test_vmvm_runtime_cancellation_failure_destroys_before_return(monkeypatch) -> None:
+async def test_vmvm_runtime_cancellation_failure_destroys_before_return(
+    monkeypatch,
+) -> None:
     backend = FakeBackend()
     started = threading.Event()
     release = threading.Event()
@@ -287,7 +362,9 @@ async def test_vmvm_runtime_cancellation_failure_destroys_before_return(monkeypa
     backend.run_bash = run_bash
     backend.cancel_active_command = cancel_active_command
     backend.destroy = destroy
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 1.0)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
@@ -332,7 +409,9 @@ async def test_vmvm_runtime_cancellation_has_one_total_deadline(monkeypatch) -> 
     backend.run_bash = run_bash
     backend.cancel_active_command = cancel_active_command
     backend.destroy = destroy
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 0.4)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
@@ -380,7 +459,9 @@ async def test_vmvm_runtime_retains_quarantined_backend_until_workers_finish(
     backend.run_bash = run_bash
     backend.cancel_active_command = cancel_active_command
     backend.destroy = destroy
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 0.05)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
@@ -439,7 +520,9 @@ async def test_vmvm_runtime_cancellation_bypasses_saturated_default_executor(
 
     backend.run_bash = run_bash
     backend.cancel_active_command = cancel_active_command
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 1.0)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
@@ -538,7 +621,10 @@ async def test_vmvm_runtime_simultaneous_cancellations_have_reserved_control_cap
         async with asyncio.timeout(1):
             while not all(event.is_set() for event in executor_started):
                 await asyncio.sleep(0.001)
-        operations = [asyncio.create_task(runtime.run_program(["run-agent"], {})) for runtime in runtimes]
+        operations = [
+            asyncio.create_task(runtime.run_program(["run-agent"], {}))
+            for runtime in runtimes
+        ]
         async with asyncio.timeout(1):
             while not all(event.is_set() for event in started):
                 await asyncio.sleep(0.001)
@@ -565,7 +651,9 @@ async def test_vmvm_runtime_simultaneous_cancellations_have_reserved_control_cap
     assert all(not runtime._worker_threads for runtime in runtimes)
 
 
-async def test_vmvm_runtime_cancelled_provisioning_destroys_late_backend(monkeypatch) -> None:
+async def test_vmvm_runtime_cancelled_provisioning_destroys_late_backend(
+    monkeypatch,
+) -> None:
     backend = FakeBackend()
     create_started = threading.Event()
     create_release = threading.Event()
@@ -637,7 +725,9 @@ async def test_vmvm_runtime_over_grace_provisioning_thread_retains_cleanup_owner
     assert runtime._backend is None
 
 
-async def test_vmvm_runtime_provisioning_cancel_signal_unblocks_factory(monkeypatch) -> None:
+async def test_vmvm_runtime_provisioning_cancel_signal_unblocks_factory(
+    monkeypatch,
+) -> None:
     started = threading.Event()
     cancellation_seen = threading.Event()
 
@@ -664,7 +754,9 @@ async def test_vmvm_runtime_provisioning_cancel_signal_unblocks_factory(monkeypa
     assert not runtime._worker_threads
 
 
-async def test_vmvm_runtime_cancelled_initial_command_drains_and_destroys(monkeypatch) -> None:
+async def test_vmvm_runtime_cancelled_initial_command_drains_and_destroys(
+    monkeypatch,
+) -> None:
     backend = FakeBackend()
     mkdir_started = threading.Event()
     mkdir_release = threading.Event()
@@ -683,7 +775,9 @@ async def test_vmvm_runtime_cancelled_initial_command_drains_and_destroys(monkey
 
     backend.run_bash = run_bash
     backend.cancel_active_command = cancel_active_command
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 1.0)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     starting = asyncio.create_task(runtime.start())
@@ -729,7 +823,9 @@ async def test_vmvm_runtime_final_destroy_removes_resource_created_after_first_d
 
     backend.start_compose = start_compose
     backend.destroy = destroy
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 1.0)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
@@ -750,7 +846,9 @@ async def test_vmvm_runtime_final_destroy_removes_resource_created_after_first_d
     assert not runtime._worker_threads
 
 
-async def test_vmvm_runtime_cancelled_write_drains_before_invalidating(monkeypatch) -> None:
+async def test_vmvm_runtime_cancelled_write_drains_before_invalidating(
+    monkeypatch,
+) -> None:
     backend = FakeBackend()
     started = threading.Event()
     release = threading.Event()
@@ -771,7 +869,9 @@ async def test_vmvm_runtime_cancelled_write_drains_before_invalidating(monkeypat
 
     backend.transfer_file = transfer_file
     backend.destroy = destroy
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 1.0)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
@@ -829,7 +929,9 @@ async def test_vmvm_runtime_cancelled_backend_operations_fail_closed(
         release.set()
 
     backend.destroy = destroy
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     monkeypatch.setattr(vmvm, "COMMAND_CANCELLATION_GRACE_SECONDS", 1.0)
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
@@ -874,7 +976,9 @@ async def test_vmvm_runtime_activates_network_before_deferred_startup_and_progra
 
     backend.activate_network_isolation = activate
     backend.run_bash = run_bash
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
 
@@ -886,7 +990,9 @@ async def test_vmvm_runtime_activates_network_before_deferred_startup_and_progra
     assert result.exit_code == 0
     assert backend.network_prepare_calls == 1
     assert events == ["activate", "startup", "program"]
-    isolated_commands = [command for command, _ in backend.commands if "NO_PROXY=*" in command]
+    isolated_commands = [
+        command for command, _ in backend.commands if "NO_PROXY=*" in command
+    ]
     assert len(isolated_commands) == 3
     assert any("socket.create_connection" in command for command in isolated_commands)
     assert any("curl --noproxy" in command for command in isolated_commands)
@@ -918,7 +1024,9 @@ async def test_vmvm_runtime_closes_tunnel_when_post_isolation_http_probe_fails(
         return backend.result
 
     backend.run_bash = run_bash
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
     await runtime.configure_network_policy("no-network")
@@ -941,7 +1049,9 @@ async def test_vmvm_runtime_preserves_body_error_when_tunnel_remains_reachable(
     body_error: Exception,
 ) -> None:
     backend = FakeBackend()
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
 
@@ -950,7 +1060,11 @@ async def test_vmvm_runtime_preserves_body_error_when_tunnel_remains_reachable(
             raise body_error
 
     assert caught.value is body_error
-    probes = [command for command, _ in backend.commands if "socket.create_connection" in command]
+    probes = [
+        command
+        for command, _ in backend.commands
+        if "socket.create_connection" in command
+    ]
     assert len(probes) == 1
     assert "NO_PROXY=*" in probes[0]
     assert "curl --noproxy" in probes[0]
@@ -963,7 +1077,9 @@ async def test_vmvm_runtime_reclassifies_body_error_when_tunnel_became_unreachab
     monkeypatch,
 ) -> None:
     backend = FakeBackend()
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
     body_error = ProviderError("provider failed")
@@ -985,7 +1101,9 @@ async def test_vmvm_runtime_reclassifies_body_error_when_tunnel_became_unreachab
 
 async def test_vmvm_runtime_does_not_recover_command_timeout(monkeypatch) -> None:
     backend = FakeBackend()
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
     backend.result = {
@@ -1003,9 +1121,13 @@ async def test_vmvm_runtime_does_not_recover_command_timeout(monkeypatch) -> Non
     await runtime.stop()
 
 
-async def test_vmvm_runtime_recovers_in_flight_command_exactly_once(monkeypatch) -> None:
+async def test_vmvm_runtime_recovers_in_flight_command_exactly_once(
+    monkeypatch,
+) -> None:
     backend = FakeBackend()
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
     backend.result = {
@@ -1032,9 +1154,13 @@ async def test_vmvm_runtime_recovers_in_flight_command_exactly_once(monkeypatch)
     await runtime.stop()
 
 
-async def test_vmvm_runtime_recovers_across_repeated_transport_drops(monkeypatch) -> None:
+async def test_vmvm_runtime_recovers_across_repeated_transport_drops(
+    monkeypatch,
+) -> None:
     backend = FakeBackend()
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
     backend.result = {
@@ -1069,7 +1195,9 @@ async def test_vmvm_runtime_recovers_across_repeated_transport_drops(monkeypatch
 
 async def test_vmvm_runtime_bounds_repeated_transport_recovery(monkeypatch) -> None:
     backend = FakeBackend()
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
     dropped: vmvm.VMVMBashResult = {
@@ -1104,7 +1232,9 @@ async def test_vmvm_runtime_rejects_unrecoverable_command(
     match: str,
 ) -> None:
     backend = FakeBackend()
-    monkeypatch.setattr(vmvm, "create_backend", lambda config, cancel_event=None: backend)
+    monkeypatch.setattr(
+        vmvm, "create_backend", lambda config, cancel_event=None: backend
+    )
     runtime = VMVMRuntime(VMVMConfig(session_timeout=10))
     await runtime.start()
     backend.result = {
