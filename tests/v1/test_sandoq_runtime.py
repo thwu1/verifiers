@@ -1,4 +1,5 @@
 import asyncio
+import os
 import stat
 import sys
 import threading
@@ -101,7 +102,11 @@ def test_sandoq_no_network_rejects_unapproved_precreate_config(
     monkeypatch.setattr(
         Path,
         "lstat",
-        lambda _path: SimpleNamespace(st_mode=stat.S_IFREG | 0o600),
+        lambda _path: SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_uid=os.getuid(),
+            st_nlink=1,
+        ),
     )
     monkeypatch.setattr(Path, "is_symlink", lambda _path: False)
     module = ModuleType("sandoq_provider.oci_client")
@@ -150,7 +155,11 @@ def test_sandoq_no_network_accepts_exact_precreate_config(monkeypatch) -> None:
     monkeypatch.setattr(
         Path,
         "lstat",
-        lambda _path: SimpleNamespace(st_mode=stat.S_IFREG | 0o600),
+        lambda _path: SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_uid=os.getuid(),
+            st_nlink=1,
+        ),
     )
     monkeypatch.setattr(Path, "is_symlink", lambda _path: False)
     module = ModuleType("sandoq_provider.oci_client")
@@ -193,6 +202,48 @@ def test_sandoq_no_network_accepts_exact_precreate_config(monkeypatch) -> None:
         )
         is client
     )
+
+
+def test_sandoq_public_host_harness_accepts_official_provider(
+    monkeypatch, tmp_path: Path
+) -> None:
+    client = object()
+    ecr_token_file = tmp_path / "ecr-token"
+    ecr_token_file.write_text("opaque-token\n")
+    ecr_token_file.chmod(0o600)
+    reads: list[tuple[str, Path]] = []
+    module = ModuleType("sandoq_provider.oci_client")
+    module.get_oci_config = lambda: SimpleNamespace(
+        environment="oci-runner",
+        task_network="none",
+        token_file=Path("/opaque/sandoq-token"),
+        ecr=SimpleNamespace(
+            enabled=True,
+            registry="168653207203.dkr.ecr.us-east-2.amazonaws.com",
+            region="us-east-2",
+            pull_through_prefix="pt_dockerio",
+            token_file=ecr_token_file,
+        ),
+    )
+    module.read_token_file = lambda path: reads.append(("sandoq", path))
+    module.OCIRunnerAsyncSandboxClient = lambda: client
+    monkeypatch.setitem(sys.modules, "sandoq_provider.oci_client", module)
+    secrets_module = ModuleType("sandoq_provider.secrets")
+    secrets_module.read_secret_file = lambda path, *_args: reads.append(("ecr", path))
+    monkeypatch.setitem(sys.modules, "sandoq_provider.secrets", secrets_module)
+
+    config = SandoqConfig(
+        network_access=True,
+        host_tunnel="none",
+        expected_environment="oci-runner",
+        ecr_token_file=ecr_token_file,
+    )
+
+    assert sandoq.create_client(config) is client
+    assert reads == [
+        ("ecr", ecr_token_file),
+        ("sandoq", Path("/opaque/sandoq-token")),
+    ]
 
 
 async def test_sandoq_runtime_lifecycle(monkeypatch) -> None:
@@ -245,6 +296,28 @@ async def test_sandoq_runtime_lifecycle(monkeypatch) -> None:
     await runtime.stop()
     assert client.deleted == ["assignment-123"]
     assert client.closed is True
+
+
+async def test_sandoq_runtime_builds_prime_sandboxes_042_container_request(
+    monkeypatch,
+) -> None:
+    client = FakeSandoqClient()
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    import prime_sandboxes
+
+    def strict_request(**values):
+        assert "network_access" not in values
+        assert values["vm"] is False
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(prime_sandboxes, "CreateSandboxRequest", strict_request)
+    runtime = SandoqRuntime(SandoqConfig(), name="rollout-042")
+
+    await runtime.start()
+
+    assert client.request.name == "rollout-042"
+    assert client.request.vm is False
+    await runtime.stop()
 
 
 async def test_sandoq_environment_mode_creates_configured_workdir(monkeypatch) -> None:
@@ -311,7 +384,7 @@ def test_sandoq_create_client_rechecks_host_policy_after_unvalidated_copy(
     }
     config = SandoqConfig.model_construct(**values)
 
-    with pytest.raises(SandboxError, match="host-side no-network configuration"):
+    with pytest.raises(SandboxError, match="host-side configuration"):
         sandoq.create_client(config)
 
 

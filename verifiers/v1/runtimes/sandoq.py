@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import os
 import shlex
 import stat
 import sys
@@ -27,6 +28,26 @@ from verifiers.v1.runtimes.limiters import creation_limiter
 from verifiers.v1.runtimes.modal_tunnel import modal_host_endpoint
 
 logger = logging.getLogger(__name__)
+
+_PUBLIC_OCI_ENVIRONMENT = "oci-runner"
+_ISOLATED_OCI_ENVIRONMENT = "oci-runner-firecracker"
+_PRODUCTION_ECR_REGISTRY = "168653207203.dkr.ecr.us-east-2.amazonaws.com"
+_PRODUCTION_ECR_REGION = "us-east-2"
+_PRODUCTION_ECR_PULL_THROUGH_PREFIX = "pt_dockerio"
+
+
+def _host_harness_environment(config: "SandoqConfig") -> str | None:
+    """Return the one environment approved for an explicit host-harness profile."""
+    if (
+        config.mode != "oci-runner"
+        or config.host_tunnel != "none"
+        or config.ecr_token_file is None
+        or not config.ecr_token_file.is_absolute()
+    ):
+        return None
+    if config.network_access:
+        return _PUBLIC_OCI_ENVIRONMENT
+    return _ISOLATED_OCI_ENVIRONMENT
 
 
 async def _finish_thread_task(
@@ -92,15 +113,14 @@ class SandoqConfig(BaseConfig):
                 "guest_tunnel_url must be an explicit HTTP loopback URL with a port"
             )
         if self.mode == "oci-runner" and self.host_tunnel == "none":
+            expected_environment = _host_harness_environment(self)
             if (
-                self.network_access is not False
-                or self.expected_environment != "oci-runner-firecracker"
-                or self.ecr_token_file is None
-                or not self.ecr_token_file.is_absolute()
+                expected_environment is None
+                or self.expected_environment != expected_environment
             ):
                 raise ValueError(
-                    "Sandoq host-side execution requires network_access=false, the "
-                    "production Firecracker environment, and an absolute ECR token path"
+                    "Sandoq host-side execution requires an approved network/environment "
+                    "profile and an absolute ECR token path"
                 )
         elif self.mode == "oci-runner" and not self.network_access:
             raise ValueError(
@@ -114,15 +134,13 @@ class SandoqConfig(BaseConfig):
 
 
 def create_client(config: SandoqConfig) -> Any:
-    """Construct the PR-pinned provider lazily so other runtimes need no internal dependency."""
+    """Construct the maintained Sandoq provider without loading it for other runtimes."""
+    host_harness_environment = _host_harness_environment(config)
     if config.host_tunnel == "none" and (
-        config.mode != "oci-runner"
-        or config.network_access is not False
-        or config.expected_environment != "oci-runner-firecracker"
-        or config.ecr_token_file is None
-        or not config.ecr_token_file.is_absolute()
+        host_harness_environment is None
+        or config.expected_environment != host_harness_environment
     ):
-        raise SandboxError("Sandoq host-side no-network configuration is incomplete")
+        raise SandboxError("Sandoq host-side configuration is incomplete")
     if (
         config.mode == "oci-runner"
         and not config.network_access
@@ -143,31 +161,30 @@ def create_client(config: SandoqConfig) -> Any:
             oci_config = get_oci_config()
             if config.host_tunnel == "none" and oci_config.task_network != "none":
                 raise SandboxError(
-                    "Sandoq host-side harnesses require nested task networking to be disabled"
+                    "Sandoq host-side harnesses require the provider's default task-network setting"
                 )
             if config.host_tunnel == "sandoq" and oci_config.task_network != "host":
                 raise SandboxError(
                     "Sandoq native reverse tunnels require nested host networking"
                 )
-            if not config.network_access:
-                expected_environment = "oci-runner-firecracker"
+            if config.host_tunnel == "none":
+                assert host_harness_environment is not None
                 ecr_token_file = oci_config.ecr.token_file
                 try:
                     ecr_token_stat = ecr_token_file.lstat()
                 except (AttributeError, OSError) as error:
                     raise SandboxError(
-                        "Sandoq no-network requires an available ECR token file"
+                        "Sandoq host-side execution requires an available ECR token file"
                     ) from error
                 if (
-                    config.expected_environment != expected_environment
-                    or oci_config.environment != expected_environment
-                    or config.host_tunnel != "none"
+                    config.expected_environment != host_harness_environment
+                    or oci_config.environment != host_harness_environment
                     or oci_config.task_network != "none"
                     or not oci_config.ecr.enabled
-                    or oci_config.ecr.registry
-                    != "168653207203.dkr.ecr.us-east-2.amazonaws.com"
-                    or oci_config.ecr.region != "us-east-2"
-                    or oci_config.ecr.pull_through_prefix != "pt_dockerio"
+                    or oci_config.ecr.registry != _PRODUCTION_ECR_REGISTRY
+                    or oci_config.ecr.region != _PRODUCTION_ECR_REGION
+                    or oci_config.ecr.pull_through_prefix
+                    != _PRODUCTION_ECR_PULL_THROUGH_PREFIX
                     or config.ecr_token_file is None
                     or not config.ecr_token_file.is_absolute()
                     or not ecr_token_file.is_absolute()
@@ -175,7 +192,17 @@ def create_client(config: SandoqConfig) -> Any:
                     or ecr_token_file.is_symlink()
                     or not stat.S_ISREG(ecr_token_stat.st_mode)
                     or stat.S_IMODE(ecr_token_stat.st_mode) != 0o600
-                    or oci_config.allow_dockerhub_fallback
+                    or ecr_token_stat.st_uid != os.getuid()
+                    or ecr_token_stat.st_nlink != 1
+                ):
+                    raise SandboxError(
+                        "Sandoq host-side execution requires the selected OCI environment "
+                        "and authenticated production ECR pull-through"
+                    )
+                read_secret_file(ecr_token_file, "ECR token", SandboxError)
+            if not config.network_access:
+                if (
+                    getattr(oci_config, "allow_dockerhub_fallback", True)
                     or oci_config.create_deadline_s != 1800
                     or oci_config.pull_timeout_s != 1200
                     or oci_config.pull_poll_max_errors != 10
@@ -191,7 +218,6 @@ def create_client(config: SandoqConfig) -> Any:
                         "authenticated production ECR pull-through, and disabled "
                         "direct-Docker-Hub fallback"
                     )
-                read_secret_file(ecr_token_file, "ECR token", SandboxError)
             read_token_file(oci_config.token_file)
             return OCIRunnerAsyncSandboxClient()
         from sandoq_provider.client import SandoqAsyncSandboxClient
@@ -201,8 +227,8 @@ def create_client(config: SandoqConfig) -> Any:
         if error.name not in {"sandoq_provider", "sandoq_client"}:
             raise
         raise ModuleNotFoundError(
-            "SandoqRuntime requires the pinned provider from deps/sandoq-provider/"
-            "extensions/sandoq on PYTHONPATH and its sandoq-client dependency"
+            "SandoqRuntime requires Prime-RL extensions/sandoq on PYTHONPATH and its "
+            "official sandoq-client dependency"
         ) from error
 
 
@@ -245,7 +271,9 @@ class SandoqRuntime(Runtime):
             disk_size_gb=self.config.disk,
             gpu_count=gpu_count,
             gpu_type=gpu_type,
-            network_access=self.config.network_access,
+            # prime-sandboxes 0.2.42 represents container mode explicitly via
+            # ``vm=False``. Network policy is owned and prevalidated by the
+            # maintained Sandoq OCI provider, not by this request model.
             vm=False,
             timeout_minutes=24 * 60,
             # The authoritative OCI provider validates this directory before it
