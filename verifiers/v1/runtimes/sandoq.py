@@ -109,27 +109,18 @@ class SandoqConfig(BaseConfig):
             or parsed.query
             or parsed.fragment
         ):
-            raise ValueError(
-                "guest_tunnel_url must be an explicit HTTP loopback URL with a port"
-            )
+            raise ValueError("guest_tunnel_url must be an explicit HTTP loopback URL with a port")
         if self.mode == "oci-runner" and self.host_tunnel == "none":
             expected_environment = _host_harness_environment(self)
-            if (
-                expected_environment is None
-                or self.expected_environment != expected_environment
-            ):
+            if expected_environment is None or self.expected_environment != expected_environment:
                 raise ValueError(
                     "Sandoq host-side execution requires an approved network/environment "
                     "profile and an absolute ECR token path"
                 )
         elif self.mode == "oci-runner" and not self.network_access:
-            raise ValueError(
-                "Sandoq OCI no-network execution requires a host-side harness and no host tunnel"
-            )
+            raise ValueError("Sandoq OCI no-network execution requires a host-side harness and no host tunnel")
         if self.host_tunnel == "none" and self.mode != "oci-runner":
-            raise ValueError(
-                "Sandoq host-side execution is supported only by OCI runner mode"
-            )
+            raise ValueError("Sandoq host-side execution is supported only by OCI runner mode")
         return self
 
 
@@ -137,18 +128,11 @@ def create_client(config: SandoqConfig) -> Any:
     """Construct the maintained Sandoq provider without loading it for other runtimes."""
     host_harness_environment = _host_harness_environment(config)
     if config.host_tunnel == "none" and (
-        host_harness_environment is None
-        or config.expected_environment != host_harness_environment
+        host_harness_environment is None or config.expected_environment != host_harness_environment
     ):
         raise SandboxError("Sandoq host-side configuration is incomplete")
-    if (
-        config.mode == "oci-runner"
-        and not config.network_access
-        and config.host_tunnel != "none"
-    ):
-        raise SandboxError(
-            "Sandoq OCI no-network execution requires a host-side harness and no host tunnel"
-        )
+    if config.mode == "oci-runner" and not config.network_access and config.host_tunnel != "none":
+        raise SandboxError("Sandoq OCI no-network execution requires a host-side harness and no host tunnel")
     try:
         if config.mode == "oci-runner":
             from sandoq_provider.oci_client import (
@@ -160,22 +144,16 @@ def create_client(config: SandoqConfig) -> Any:
 
             oci_config = get_oci_config()
             if config.host_tunnel == "none" and oci_config.task_network != "none":
-                raise SandboxError(
-                    "Sandoq host-side harnesses require the provider's default task-network setting"
-                )
+                raise SandboxError("Sandoq host-side harnesses require the provider's default task-network setting")
             if config.host_tunnel == "sandoq" and oci_config.task_network != "host":
-                raise SandboxError(
-                    "Sandoq native reverse tunnels require nested host networking"
-                )
+                raise SandboxError("Sandoq native reverse tunnels require nested host networking")
             if config.host_tunnel == "none":
                 assert host_harness_environment is not None
                 ecr_token_file = oci_config.ecr.token_file
                 try:
                     ecr_token_stat = ecr_token_file.lstat()
                 except (AttributeError, OSError) as error:
-                    raise SandboxError(
-                        "Sandoq host-side execution requires an available ECR token file"
-                    ) from error
+                    raise SandboxError("Sandoq host-side execution requires an available ECR token file") from error
                 if (
                     config.expected_environment != host_harness_environment
                     or oci_config.environment != host_harness_environment
@@ -183,8 +161,7 @@ def create_client(config: SandoqConfig) -> Any:
                     or not oci_config.ecr.enabled
                     or oci_config.ecr.registry != _PRODUCTION_ECR_REGISTRY
                     or oci_config.ecr.region != _PRODUCTION_ECR_REGION
-                    or oci_config.ecr.pull_through_prefix
-                    != _PRODUCTION_ECR_PULL_THROUGH_PREFIX
+                    or oci_config.ecr.pull_through_prefix != _PRODUCTION_ECR_PULL_THROUGH_PREFIX
                     or config.ecr_token_file is None
                     or not config.ecr_token_file.is_absolute()
                     or not ecr_token_file.is_absolute()
@@ -227,8 +204,7 @@ def create_client(config: SandoqConfig) -> Any:
         if error.name not in {"sandoq_provider", "sandoq_client"}:
             raise
         raise ModuleNotFoundError(
-            "SandoqRuntime requires Prime-RL extensions/sandoq on PYTHONPATH and its "
-            "official sandoq-client dependency"
+            "SandoqRuntime requires Prime-RL extensions/sandoq on PYTHONPATH and its official sandoq-client dependency"
         ) from error
 
 
@@ -285,10 +261,7 @@ class SandoqRuntime(Runtime):
             else None,
         )
         try:
-            async with (
-                creation_limiter(self.config.creates_per_sec, "sandoq-sandbox")
-                or contextlib.nullcontext()
-            ):
+            async with creation_limiter(self.config.creates_per_sec, "sandoq-sandbox") or contextlib.nullcontext():
                 sandbox = await client.create(request)
                 self._sandbox_id = str(sandbox.id)
                 self._active = True
@@ -306,8 +279,7 @@ class SandoqRuntime(Runtime):
             _, delete_error = await self._delete_active(client)
             if delete_error is not None:
                 logger.warning(
-                    "sandoq: deletion was not verified after cancelled provisioning "
-                    "for %s: %s",
+                    "sandoq: deletion was not verified after cancelled provisioning for %s: %s",
                     self._sandbox_id,
                     delete_error,
                 )
@@ -335,9 +307,7 @@ class SandoqRuntime(Runtime):
             self.config.image,
         )
 
-    async def _delete_active(
-        self, client: Any
-    ) -> tuple[asyncio.CancelledError | None, Exception | None]:
+    async def _delete_active(self, client: Any) -> tuple[asyncio.CancelledError | None, Exception | None]:
         """Finish one delete attempt even when this task receives repeated cancellation."""
         if not self._active or self._sandbox_id is None:
             return None, None
@@ -404,10 +374,7 @@ class SandoqRuntime(Runtime):
             timeout=int(self.config.session_timeout),
         )
         stderr = result.stderr or ""
-        if (
-            result.exit_code == 75
-            and "execution status is unknown and the command was not replayed" in stderr
-        ):
+        if result.exit_code == 75 and "execution status is unknown and the command was not replayed" in stderr:
             raise SandboxError(stderr)
         return ProgramResult(
             exit_code=result.exit_code if result.exit_code is not None else -1,
@@ -425,15 +392,39 @@ class SandoqRuntime(Runtime):
             # have side effects in the task container, so the Runtime must never replay it.
             raise SandboxError(f"Sandoq exec failed: {error}") from error
 
-    async def run_background(
-        self, argv: list[str], env: dict[str, str], log: str
-    ) -> None:
+    async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+        """Run one long-lived harness without holding a gateway request open.
+
+        OCI runner shell requests have a proxy deadline below five minutes, while an
+        agent rollout can legitimately run for hours.  The provider's background-job
+        protocol launches the command exactly once, then observes it through
+        idempotent status polls.  In particular, do not fall back to ``run`` after an
+        ambiguous launch: replaying the agent would fork the rollout trace.
+        """
+        if self._client is None:
+            raise SandboxError("Sandoq runtime is not running")
+        try:
+            result = await self._client.run_background_job(
+                self.sandbox_id,
+                shlex.join(argv),
+                timeout=int(self.config.session_timeout),
+                working_dir=self.config.workdir,
+                env=env,
+                poll_interval=3,
+            )
+        except Exception as error:
+            raise SandboxError(f"Sandoq program failed: {error}") from error
+        return ProgramResult(
+            exit_code=result.exit_code if result.exit_code is not None else -1,
+            stdout=result.stdout or "",
+            stderr=result.stderr or "",
+        )
+
+    async def run_background(self, argv: list[str], env: dict[str, str], log: str) -> None:
         inner = f"nohup {shlex.join(argv)} > {shlex.quote(log)} 2>&1 < /dev/null &"
         result = await self.run(["sh", "-c", inner], env)
         if result.exit_code != 0:
-            raise SandboxError(
-                f"Sandoq background launch failed: {(result.stderr or result.stdout).strip()}"
-            )
+            raise SandboxError(f"Sandoq background launch failed: {(result.stderr or result.stdout).strip()}")
 
     def _abs(self, path: str) -> str:
         if path.startswith("/"):
@@ -464,9 +455,7 @@ class SandoqRuntime(Runtime):
         parent = str(PurePosixPath(target).parent)
         mkdir = await self.run(["mkdir", "-p", parent], {})
         if mkdir.exit_code != 0:
-            raise SandboxError(
-                f"write {path!r}: could not create {parent}: {mkdir.stderr}"
-            )
+            raise SandboxError(f"write {path!r}: could not create {parent}: {mkdir.stderr}")
         try:
             await self._client.upload_bytes(
                 self.sandbox_id,
@@ -487,9 +476,7 @@ class SandoqRuntime(Runtime):
     @contextlib.asynccontextmanager
     async def host_endpoint(self, port: int):
         if self.config.host_tunnel == "none":
-            raise SandboxError(
-                "host_endpoint must not be called for a host-side Sandoq harness"
-            )
+            raise SandboxError("host_endpoint must not be called for a host-side Sandoq harness")
         if self.config.host_tunnel == "prime":
             async with shared_host_endpoint(port, is_local=False) as url:
                 yield url
@@ -499,9 +486,7 @@ class SandoqRuntime(Runtime):
                 yield url
             return
         if self.config.mode != "oci-runner":
-            raise SandboxError(
-                "the native Sandoq host tunnel requires mode='oci-runner'"
-            )
+            raise SandboxError("the native Sandoq host tunnel requires mode='oci-runner'")
         try:
             from sandoq_provider import registry
             from sandoq_provider.tunnel import SandoqRelayTunnel
@@ -513,26 +498,18 @@ class SandoqRuntime(Runtime):
 
         info = registry.get(self.sandbox_id)
         if info is None:
-            raise SandboxError(
-                f"Sandoq session metadata is unavailable for {self.sandbox_id!r}"
-            )
+            raise SandboxError(f"Sandoq session metadata is unavailable for {self.sandbox_id!r}")
         if self.config.expected_environment is not None:
             environment_matches = info.environment == self.config.expected_environment
         else:
             environment_matches = info.environment.startswith("oci-runner-firecracker")
         if not environment_matches:
-            raise SandboxError(
-                "the native Sandoq host tunnel received an unexpected environment"
-            )
+            raise SandboxError("the native Sandoq host tunnel received an unexpected environment")
         if info.metadata.get("task_network") != "host":
-            raise SandboxError(
-                "the native Sandoq host tunnel requires the provisioned task network to be host"
-            )
+            raise SandboxError("the native Sandoq host tunnel requires the provisioned task network to be host")
         tunnel_url = info.port_urls.get("tunnel")
         if not tunnel_url:
-            raise SandboxError(
-                f"Sandoq environment {info.environment!r} has no named 'tunnel' port"
-            )
+            raise SandboxError(f"Sandoq environment {info.environment!r} has no named 'tunnel' port")
         tunnel = SandoqRelayTunnel(
             port,
             tunnel_url=tunnel_url,
@@ -544,8 +521,7 @@ class SandoqRuntime(Runtime):
             start_cancelled, start_error = await _finish_thread_task(start_task)
             if start_error is not None:
                 raise TunnelError(
-                    "Sandoq host tunnel failed to start: "
-                    f"{type(start_error).__name__}: {start_error}"
+                    f"Sandoq host tunnel failed to start: {type(start_error).__name__}: {start_error}"
                 ) from start_error
             if start_cancelled is not None:
                 raise start_cancelled
@@ -557,8 +533,7 @@ class SandoqRuntime(Runtime):
             if cleanup_error is not None:
                 if original_error is None and cancelled is None:
                     raise TunnelError(
-                        "Sandoq host tunnel cleanup failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        f"Sandoq host tunnel cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
                     ) from cleanup_error
                 logger.warning(
                     "sandoq: tunnel cleanup failed while preserving %s: %s",
@@ -577,9 +552,7 @@ class SandoqRuntime(Runtime):
 
             result = delete_registered_sessions_sync()
             if result.get("failed"):
-                logger.warning(
-                    "sandoq: synchronous cleanup failures: %s", result["failed"]
-                )
+                logger.warning("sandoq: synchronous cleanup failures: %s", result["failed"])
             return
         from sandoq_provider.sync_client import SandoqSandboxClient
 
@@ -592,10 +565,7 @@ class SandoqRuntime(Runtime):
             return
         cancelled, provider_error = await self._delete_active(client)
         delete_error = (
-            SandboxError(
-                f"Sandoq deletion was not verified for {self._sandbox_id}: "
-                f"{provider_error}"
-            )
+            SandboxError(f"Sandoq deletion was not verified for {self._sandbox_id}: {provider_error}")
             if provider_error is not None
             else None
         )
@@ -606,8 +576,7 @@ class SandoqRuntime(Runtime):
         if cancelled is not None:
             if delete_error is not None:
                 logger.warning(
-                    "sandoq: deletion was not verified while preserving cancellation "
-                    "for %s: %s",
+                    "sandoq: deletion was not verified while preserving cancellation for %s: %s",
                     self._sandbox_id,
                     provider_error,
                 )

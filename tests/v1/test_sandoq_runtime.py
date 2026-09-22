@@ -8,9 +8,9 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
-
 from verifiers.v1.errors import SandboxError, TunnelError
 from verifiers.v1.runtimes import (
+    ProgramResult,
     SandoqConfig,
     SandoqRuntime,
     make_runtime,
@@ -24,6 +24,7 @@ class FakeSandoqClient:
     def __init__(self) -> None:
         self.request = None
         self.commands: list[tuple[str, str | None, dict[str, str], int]] = []
+        self.background_commands: list[tuple[str, str | None, dict[str, str], int, int]] = []
         self.files: dict[str, bytes] = {}
         self.deleted: list[str] = []
         self.closed = False
@@ -54,6 +55,21 @@ class FakeSandoqClient:
         if self.error is not None:
             raise self.error
         return SimpleNamespace(exit_code=0, stdout="ok", stderr="")
+
+    async def run_background_job(
+        self,
+        sandbox_id: str,
+        command: str,
+        timeout: int | None = None,
+        working_dir: str | None = None,
+        env: dict[str, str] | None = None,
+        poll_interval: int = 3,
+    ):
+        assert sandbox_id == "assignment-123"
+        self.background_commands.append((command, working_dir, env or {}, timeout or 0, poll_interval))
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(exit_code=0, stdout="program-ok", stderr="")
 
     async def upload_bytes(
         self,
@@ -204,9 +220,7 @@ def test_sandoq_no_network_accepts_exact_precreate_config(monkeypatch) -> None:
     )
 
 
-def test_sandoq_public_host_harness_accepts_official_provider(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_sandoq_public_host_harness_accepts_official_provider(monkeypatch, tmp_path: Path) -> None:
     client = object()
     ecr_token_file = tmp_path / "ecr-token"
     ecr_token_file.write_text("opaque-token\n")
@@ -276,9 +290,7 @@ async def test_sandoq_runtime_lifecycle(monkeypatch) -> None:
     assert getattr(client.request, "vm", False) is False
     assert client.request.environment_vars == {"OCI_EXPECTED_WORKDIR": "/testbed"}
 
-    result = await runtime.run(
-        ["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"}
-    )
+    result = await runtime.run(["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"})
     assert result.exit_code == 0
     assert result.stdout == "ok"
     assert client.commands == [
@@ -323,9 +335,7 @@ async def test_sandoq_runtime_builds_prime_sandboxes_042_container_request(
 async def test_sandoq_environment_mode_creates_configured_workdir(monkeypatch) -> None:
     client = FakeSandoqClient()
     monkeypatch.setattr(sandoq, "create_client", lambda config: client)
-    runtime = SandoqRuntime(
-        SandoqConfig(mode="environment", workdir="/workspace", host_tunnel="modal")
-    )
+    runtime = SandoqRuntime(SandoqConfig(mode="environment", workdir="/workspace", host_tunnel="modal"))
 
     await runtime.start()
 
@@ -465,9 +475,7 @@ async def test_sandoq_runtime_rejects_semantically_unverified_delete(
         {"nested_recycle_verified": True, "error": "cleanup incomplete"},
     ],
 )
-async def test_sandoq_runtime_rejects_ambiguous_cleanup_receipts(
-    monkeypatch, response
-) -> None:
+async def test_sandoq_runtime_rejects_ambiguous_cleanup_receipts(monkeypatch, response) -> None:
     client = FakeSandoqClient()
 
     async def ambiguous_delete(_sandbox_id: str):
@@ -639,9 +647,7 @@ async def test_sandoq_runtime_uses_native_reverse_tunnel(monkeypatch) -> None:
         port_urls={"tunnel": "https://tunnel.example/session"},
         metadata={"task_network": "host"},
     )
-    registry = SimpleNamespace(
-        get=lambda sandbox_id: info if sandbox_id == "assignment-123" else None
-    )
+    registry = SimpleNamespace(get=lambda sandbox_id: info if sandbox_id == "assignment-123" else None)
     provider = ModuleType("sandoq_provider")
     provider.registry = registry
     tunnel_module = ModuleType("sandoq_provider.tunnel")
@@ -856,6 +862,46 @@ async def test_sandoq_runtime_never_replays_uncertain_command(monkeypatch) -> No
     await runtime.stop()
 
 
+async def test_sandoq_runtime_runs_long_program_as_one_background_job(
+    monkeypatch,
+) -> None:
+    client = FakeSandoqClient()
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(workdir="/testbed", session_timeout=7200))
+    await runtime.start()
+
+    result = await runtime.run_program(["agent", "--task", "value with spaces"], {"MODEL": "kimi"})
+
+    assert result == ProgramResult(exit_code=0, stdout="program-ok", stderr="")
+    assert client.background_commands == [
+        (
+            "agent --task 'value with spaces'",
+            "/testbed",
+            {"MODEL": "kimi"},
+            7200,
+            3,
+        )
+    ]
+    await runtime.stop()
+
+
+async def test_sandoq_runtime_never_replays_uncertain_background_launch(
+    monkeypatch,
+) -> None:
+    client = FakeSandoqClient()
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(session_timeout=7200))
+    await runtime.start()
+    client.error = RuntimeError("transport unavailable after background launch")
+
+    with pytest.raises(SandboxError, match="transport unavailable"):
+        await runtime.run_program(["agent", "--task", "opaque"], {})
+
+    assert len(client.background_commands) == 1
+    client.error = None
+    await runtime.stop()
+
+
 async def test_sandoq_runtime_surfaces_unknown_gateway_result(monkeypatch) -> None:
     client = FakeSandoqClient()
     monkeypatch.setattr(sandoq, "create_client", lambda config: client)
@@ -864,9 +910,7 @@ async def test_sandoq_runtime_surfaces_unknown_gateway_result(monkeypatch) -> No
     client.commands.clear()
 
     async def unknown_result(*args, **kwargs):
-        client.commands.append(
-            (args[1], kwargs.get("working_dir"), kwargs.get("env", {}), 10)
-        )
+        client.commands.append((args[1], kwargs.get("working_dir"), kwargs.get("env", {}), 10))
         return SimpleNamespace(
             exit_code=75,
             stdout="",
