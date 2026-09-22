@@ -75,6 +75,14 @@ class _BashSubprocess:
 
     PIPE = subprocess.PIPE
     STDOUT = subprocess.STDOUT
+    CompletedProcess = subprocess.CompletedProcess
+    TimeoutExpired = subprocess.TimeoutExpired
+
+    @staticmethod
+    def Popen(command, *args, **kwargs):
+        if kwargs.pop("shell", False):
+            command = ["bash", "-lc", command]
+        return subprocess.Popen(command, *args, **kwargs)
 
     @staticmethod
     def run(command, *args, **kwargs):
