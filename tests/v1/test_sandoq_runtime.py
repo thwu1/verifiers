@@ -902,6 +902,30 @@ async def test_sandoq_runtime_never_replays_uncertain_background_launch(
     await runtime.stop()
 
 
+async def test_sandoq_environment_cancellation_prevents_scoring(monkeypatch) -> None:
+    client = FakeSandoqClient()
+    running = asyncio.Event()
+
+    async def background(*_args, **_kwargs):
+        running.set()
+        await asyncio.Event().wait()
+
+    client.run_background_job = background
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(mode="environment"))
+    await runtime.start()
+    program = asyncio.create_task(runtime.run_program(["agent"], {}))
+    await running.wait()
+
+    program.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await program
+    with pytest.raises(SandboxError, match="was not joined"):
+        runtime.ensure_usable()
+
+    await runtime.stop()
+
+
 async def test_sandoq_runtime_surfaces_unknown_gateway_result(monkeypatch) -> None:
     client = FakeSandoqClient()
     monkeypatch.setattr(sandoq, "create_client", lambda config: client)

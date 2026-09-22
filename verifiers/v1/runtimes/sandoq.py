@@ -221,6 +221,7 @@ class SandoqRuntime(Runtime):
         self._client: Any = None
         self._sandbox_id: str | None = None
         self._active = False
+        self._program_cleanup_error: str | None = None
 
     @property
     def descriptor(self) -> str | None:
@@ -412,6 +413,13 @@ class SandoqRuntime(Runtime):
                 env=env,
                 poll_interval=3,
             )
+        except asyncio.CancelledError:
+            # OCI runner joins or quarantines its background job before propagating
+            # cancellation. The generic environment API has no equivalent stop/join
+            # primitive, so a cancelled program must never proceed to task scoring.
+            if self.config.mode != "oci-runner":
+                self._program_cleanup_error = "cancelled Sandoq environment program was not joined"
+            raise
         except Exception as error:
             raise SandboxError(f"Sandoq program failed: {error}") from error
         return ProgramResult(
@@ -419,6 +427,10 @@ class SandoqRuntime(Runtime):
             stdout=result.stdout or "",
             stderr=result.stderr or "",
         )
+
+    def ensure_usable(self) -> None:
+        if self._program_cleanup_error is not None:
+            raise SandboxError(self._program_cleanup_error)
 
     async def run_background(self, argv: list[str], env: dict[str, str], log: str) -> None:
         inner = f"nohup {shlex.join(argv)} > {shlex.quote(log)} 2>&1 < /dev/null &"
