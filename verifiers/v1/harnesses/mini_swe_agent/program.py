@@ -10,12 +10,33 @@ import sys
 import tempfile
 from pathlib import Path
 
+import litellm
 import yaml
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.agents.interactive import InteractiveAgent
 from minisweagent.config import get_config_path
 from minisweagent.environments import local as local_environment
+from minisweagent.models.litellm_model import LitellmModel
 from minisweagent.run.mini import app
+
+_ORIGINAL_LITELLM_QUERY = LitellmModel._query
+
+
+def _streaming_litellm_query(self, messages, **kwargs):
+    """Keep long model requests alive, then rebuild MiniSWE's normal response.
+
+    Verifiers' interception endpoint supports OpenAI streaming and emits
+    periodic SSE keepalive comments.  Consuming that stream here prevents a
+    quiet guest-to-controller tunnel from expiring during long reasoning
+    generations.  MiniSWE still receives one ordinary ModelResponse, including
+    reconstructed reasoning content, tool calls, finish reason, and usage.
+    """
+    stream_kwargs = {**kwargs, "stream": True}
+    chunks = list(_ORIGINAL_LITELLM_QUERY(self, messages, **stream_kwargs))
+    response = litellm.stream_chunk_builder(chunks, messages=messages)
+    if response is None:
+        raise RuntimeError("LiteLLM returned no response while rebuilding the stream")
+    return response
 
 
 def _merged_config_argv(argv: list[str]) -> list[str]:
@@ -96,5 +117,6 @@ class _BashSubprocess:
 # use DefaultAgent's benchmark-compatible terminal handling for step limits.
 InteractiveAgent.query = DefaultAgent.query
 local_environment.subprocess = _BashSubprocess
+LitellmModel._query = _streaming_litellm_query
 sys.argv = _merged_config_argv(sys.argv)
 app()
