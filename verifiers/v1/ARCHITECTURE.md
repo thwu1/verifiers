@@ -34,9 +34,14 @@ Episode (task, n)
    │     └─ model calls → interception server → client → graph.add_turn()
    ├─ taskset.finalize(task, trace, runtime)  # Phase.FINALIZE— wait_for(finalize_timeout)
    ├─ taskset.score + harness.score           # Phase.SCORING — wait_for(scoring_timeout)
+   ├─ taskset.cleanup(task, trace, runtime)   # every terminal path
    └─ runtime.stop()                          # guaranteed teardown (also atexit-guarded)
    ⤷ Episode then runs @group_reward across the task's N traces
 ```
+
+After all episodes and shared serving resources have stopped, the evaluator calls
+`taskset.close()` once to release taskset-wide caches. Both cleanup hooks also run
+during graceful cancellation.
 
 Each stage is bounded by its own `asyncio.wait_for` (`rollout.py`), so a wedge in any one
 phase is a budget event, not a hang — a `harness_timeout` scores what's there; a
@@ -145,10 +150,11 @@ thousands of servers or tunnels.
 A `Runtime` (`runtimes/base.py`) is the single contract for *where* code runs:
 `start`/`stop`/`cleanup`, `run(argv, env)` and `run_background(...)`, `run_uv_script(...)`,
 `read`/`write`, and `expose(port)` (the URL by which the host reaches a port inside the
-runtime — localhost for subprocess, a tunnel for prime/modal). The same contract backs the
+runtime — localhost for subprocess, a tunnel for prime/modal/sandoq/vmvm). The same contract backs the
 harness, a task's tool servers, and the user simulator, so any of them runs in any backend:
 `subprocess` (local, `/tmp/<name>` workspace, own process group), `docker` (local container),
-`prime` (remote sandbox), `modal` (remote function).
+`prime` (remote sandbox), `modal` (remote function), `sandoq` (remote session),
+`vmvm` (remote vacli VM).
 
 Resources are named after the rollout id (greppable) and their teardown is guaranteed: a live
 runtime registers in a `WeakSet`, and an `atexit` hook reaps anything a signal-interrupted

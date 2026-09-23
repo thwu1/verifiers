@@ -6,11 +6,11 @@ import logging
 import random
 import time
 
+from verifiers.v1.cli.dashboard import dashboard
+from verifiers.v1.cli.eval import resume
+from verifiers.v1.cli.output import append_trace, output_path, save_config
 from verifiers.v1.clients import RolloutContext, resolve_client
 from verifiers.v1.configs.eval import EvalConfig
-from verifiers.v1.cli.eval import resume
-from verifiers.v1.cli.dashboard import dashboard
-from verifiers.v1.cli.output import append_trace, output_path, save_config
 from verifiers.v1.decorators import discover_decorated
 from verifiers.v1.env import Environment
 from verifiers.v1.trace import Trace
@@ -44,7 +44,12 @@ async def run_eval(env: Environment, config: EvalConfig) -> list[Trace]:
     if config.resume is not None:
         group = bool(discover_decorated(env.taskset, "group_reward"))
         keep, owed = resume.plan(
-            out, [t.idx for t in tasks], config.num_rollouts, group
+            out,
+            [t.idx for t in tasks],
+            config.num_rollouts,
+            group,
+            require_exact_tokens=resume.exact_tokens_requested(config),
+            require_logprobs=resume.logprobs_requested(config),
         )
         if not owed:  # already complete - report it and exit successfully
             print(resume.nothing_to_resume_msg(out, len(tasks), config.num_rollouts))
@@ -89,9 +94,23 @@ async def run_eval(env: Environment, config: EvalConfig) -> list[Trace]:
             else contextlib.nullcontext()
         )
         async with display:
-            results = await asyncio.gather(
-                *(episode.run(semaphore, on_complete) for episode in episodes)
-            )
+            running = [
+                asyncio.create_task(
+                    episode.run(
+                        semaphore,
+                        on_complete,
+                        retain_traces=config.retain_traces,
+                    )
+                )
+                for episode in episodes
+            ]
+            try:
+                results = await asyncio.gather(*running)
+            except BaseException:
+                for task in running:
+                    task.cancel()
+                await asyncio.gather(*running, return_exceptions=True)
+                raise
     traces = [trace for episode_traces in results for trace in episode_traces]
     await client.close()
     return traces
@@ -105,9 +124,9 @@ async def run_eval_server(config: EvalConfig) -> list[Trace]:
     import multiprocessing as mp
     from functools import partial
 
-    from verifiers.v1.utils.logging import setup_logging
     from verifiers.v1.env import pool_serve_kwargs
     from verifiers.v1.serve import EnvClient, env_config_data, serve_env
+    from verifiers.v1.utils.logging import setup_logging
 
     legacy = config.is_legacy
     server_kwargs = (
@@ -158,7 +177,12 @@ async def run_eval_server(config: EvalConfig) -> list[Trace]:
         out = output_path(config)
         if config.resume is not None:
             keep, owed = resume.plan(
-                out, idxs, config.num_rollouts, info.requires_group_scoring
+                out,
+                idxs,
+                config.num_rollouts,
+                info.requires_group_scoring,
+                require_exact_tokens=resume.exact_tokens_requested(config),
+                require_logprobs=resume.logprobs_requested(config),
             )
             if not owed:  # already complete - report it and exit successfully
                 print(resume.nothing_to_resume_msg(out, len(idxs), config.num_rollouts))
@@ -203,7 +227,7 @@ async def run_eval_server(config: EvalConfig) -> list[Trace]:
                 )
             for trace in traces:
                 await append_trace(out, trace, write_lock)
-            return traces
+            return traces if config.retain_traces else []
 
         async def run_rollout_unit(idx: int) -> list[Trace]:
             async with semaphore or contextlib.nullcontext():
@@ -214,7 +238,7 @@ async def run_eval_server(config: EvalConfig) -> list[Trace]:
                     sampling=config.sampling,
                 )
             await append_trace(out, trace, write_lock)
-            return [trace]
+            return [trace] if config.retain_traces else []
 
         # A group-scored taskset must run each task's rollouts together (cross-rollout
         # scoring) → one `run_group` request per task (one worker). Otherwise the rollouts

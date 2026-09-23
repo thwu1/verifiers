@@ -8,7 +8,8 @@ read them in the same precedence (`reasoning` / `reasoning_content` / `reasoning
 
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Any
 
 from openai.types.chat import ChatCompletion
@@ -25,6 +26,7 @@ from verifiers.v1.types import (
     Tool,
     ToolCall,
     ToolMessage,
+    TurnTokens,
     Usage,
     UserMessage,
     content_to_parts,
@@ -36,6 +38,47 @@ FINISH_REASONS = frozenset({"stop", "length", "tool_calls"})
 # `reasoning` (vLLM / Together / OpenRouter), `reasoning_content` (DeepSeek / Qwen / SGLang /
 # Fireworks / Kimi), `reasoning_details` (OpenRouter / MiniMax).
 REASONING_FIELDS = ("reasoning", "reasoning_content", "reasoning_details")
+
+
+def _provider_value(value: Any, field: str) -> Any:
+    """Read a provider extension retained by the OpenAI Pydantic models."""
+    extra = getattr(value, "model_extra", None)
+    if not isinstance(extra, Mapping):
+        return None
+    direct = extra.get(field)
+    if direct is not None:
+        return direct
+    provider = extra.get("provider_specific_fields")
+    return provider.get(field) if isinstance(provider, Mapping) else None
+
+
+def _response_tokens(completion: ChatCompletion) -> TurnTokens | None:
+    """Parse vLLM token IDs, plus sampled logprobs when the provider returns them."""
+    choice = completion.choices[0]
+    prompt_ids = _provider_value(completion, "prompt_token_ids")
+    completion_ids = _provider_value(choice, "token_ids")
+    if not (
+        isinstance(prompt_ids, list)
+        and isinstance(completion_ids, list)
+        and all(isinstance(token, int) and not isinstance(token, bool) for token in prompt_ids)
+        and all(
+            isinstance(token, int) and not isinstance(token, bool)
+            for token in completion_ids
+        )
+    ):
+        return None
+
+    content_logprobs = choice.logprobs.content if choice.logprobs else None
+    completion_logprobs: list[float] = []
+    if content_logprobs is not None:
+        completion_logprobs = [token.logprob for token in content_logprobs]
+        if len(completion_logprobs) != len(completion_ids):
+            return None
+    return TurnTokens(
+        prompt_ids=prompt_ids,
+        completion_ids=completion_ids,
+        completion_logprobs=completion_logprobs,
+    )
 
 
 def reasoning_text(data: Mapping[str, Any]) -> str | None:
@@ -157,7 +200,7 @@ def message_to_wire(message: Message) -> dict:
 
 def response_from_wire(completion: ChatCompletion) -> Response:
     """An OpenAI chat.completion -> a vf `Response` (the one place raw provider objects cross
-    into our typed `Response`). No token ids: training tokens come from the renderer client."""
+    into our typed `Response`). vLLM token extensions are retained when present."""
     choice = completion.choices[0]
     message = choice.message
     data = message.model_dump()
@@ -200,6 +243,7 @@ def response_from_wire(completion: ChatCompletion) -> Response:
         ),
         finish_reason=finish,
         usage=usage,
+        tokens=_response_tokens(completion),
     )
 
 

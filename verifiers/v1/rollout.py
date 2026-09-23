@@ -18,22 +18,24 @@ import time
 from contextlib import asynccontextmanager
 from enum import StrEnum
 
-from verifiers.v1.harness import Harness
 from verifiers.v1.clients import RolloutContext
 from verifiers.v1.decorators import discover_decorated
 from verifiers.v1.errors import (
     HarnessError,
     RolloutError,
+    SandboxError,
     TasksetError,
     ToolsetError,
     boundary,
 )
+from verifiers.v1.harness import Harness
 from verifiers.v1.interception import (
     InterceptionPool,
     InterceptionServer,
     RolloutLimits,
     RolloutSession,
 )
+from verifiers.v1.mcp import serve_tools, serve_user
 from verifiers.v1.runtimes import (
     HOST,
     Runtime,
@@ -41,7 +43,6 @@ from verifiers.v1.runtimes import (
     make_runtime,
     reachable_url,
 )
-from verifiers.v1.mcp import serve_tools, serve_user
 from verifiers.v1.state import state_cls
 from verifiers.v1.task import Task
 from verifiers.v1.taskset import Taskset
@@ -117,7 +118,7 @@ class Rollout:
         tool server tunnels to it itself); `state_base` its reachable URL (localhost, or the pool's
         tunnel) — how a SHARED tool server reaches this rollout's `/state` + `/task` channel."""
         if pool is not None:
-            async with pool.acquire(session) as (
+            async with pool.acquire(session, runtime) as (
                 endpoint,
                 secret,
                 state_port,
@@ -128,8 +129,24 @@ class Rollout:
             async with InterceptionServer() as server:
                 secret = server.register(session)
                 # a HOST service the harness (in `runtime`) reaches: localhost or a tunnel
-                async with reachable_url(HOST, server.port, consumer=runtime) as url:
-                    yield f"{url}/v1", secret, server.port, url
+                async with reachable_url(
+                    HOST,
+                    server.port,
+                    consumer=None if self.harness.RUNS_ON_HOST else runtime,
+                    consumer_is_local=self.harness.RUNS_ON_HOST,
+                ) as url:
+                    primary_error: BaseException | None = None
+                    try:
+                        yield f"{url}/v1", secret, server.port, url
+                    except BaseException as error:
+                        primary_error = error
+                        raise
+                    finally:
+                        try:
+                            await server.unregister(secret)
+                        except BaseException:
+                            if not isinstance(primary_error, asyncio.CancelledError):
+                                raise
 
     async def run(self) -> Trace:
         """Run the rollout and return its trace. Captures expected `RolloutError`s onto
@@ -224,6 +241,7 @@ class Rollout:
                             self.harness_timeout,
                         )
                     except TimeoutError:
+                        runtime.ensure_usable()
                         trace.stop("harness_timeout")
                     except RolloutError as e:
                         if session.error is not None:
@@ -232,6 +250,7 @@ class Rollout:
                     else:
                         if session.error is not None:
                             raise session.error
+                    runtime.ensure_usable()
             now = time.time()
             trace.timing.generation.end = now
             trace.timing.finalize.start = now
@@ -269,6 +288,8 @@ class Rollout:
             logger.exception("unexpected error in rollout %s", trace.id)
             trace.capture_error(e)
         finally:
+            runtime_stopped = False
+            skip_taskset_cleanup = False
             trace.is_completed = True
             now = time.time()
             if not trace.timing.setup.end:  # error during setup: close the setup span
@@ -277,14 +298,67 @@ class Rollout:
                 trace.timing.generation.end = now  # error mid-run: close generation
             if trace.timing.finalize.start and not trace.timing.finalize.end:
                 trace.timing.finalize.end = now  # error mid-finalize: close finalize
-            # Tear down here — group rewards (later) need only the trace, not a live
-            # runtime. `runtime` is always set: make_runtime() ran before the `try`.
             try:
-                await runtime.stop()
-            except Exception:
-                logger.warning(
-                    "runtime teardown failed (rollout %s)", trace.id, exc_info=True
-                )
+                runtime.ensure_usable()
+            except RolloutError:
+                # A failed cancellation can leave detached backend work draining.
+                # Stop owns and joins that quarantine before taskset cleanup is
+                # allowed to touch the same backend.
+                try:
+                    await runtime.stop()
+                except Exception as error:
+                    if runtime.cleanup_must_succeed and trace.error is None:
+                        trace.capture_error(
+                            error
+                            if isinstance(error, RolloutError)
+                            else SandboxError(
+                                f"runtime teardown: {type(error).__name__}: {error}"
+                            )
+                        )
+                    else:
+                        logger.warning(
+                            "runtime teardown failed (rollout %s)",
+                            trace.id,
+                            exc_info=True,
+                        )
+                runtime_stopped = True
+                skip_taskset_cleanup = True
+            try:
+                if not skip_taskset_cleanup:
+                    try:
+                        async with boundary(TasksetError, "taskset cleanup"):
+                            await self.taskset.cleanup(self.task, trace, runtime)
+                    except RolloutError as error:
+                        if trace.error is None:
+                            trace.capture_error(error)
+                        else:
+                            logger.warning(
+                                "taskset cleanup failed after rollout %s already failed: %s",
+                                trace.id,
+                                error,
+                                exc_info=True,
+                            )
+            finally:
+                # Group rewards (later) need only the trace, not a live runtime.
+                # `runtime` is always set: make_runtime() ran before the `try`.
+                if not runtime_stopped:
+                    try:
+                        await runtime.stop()
+                    except Exception as error:
+                        if runtime.cleanup_must_succeed and trace.error is None:
+                            trace.capture_error(
+                                error
+                                if isinstance(error, RolloutError)
+                                else SandboxError(
+                                    f"runtime teardown: {type(error).__name__}: {error}"
+                                )
+                            )
+                        else:
+                            logger.warning(
+                                "runtime teardown failed (rollout %s)",
+                                trace.id,
+                                exc_info=True,
+                            )
         logger.info(
             "rollout done: id=%s task=%s reward=%.3f turns=%d stop=%s",
             trace.id,

@@ -16,7 +16,7 @@ config. You'll likely work with them in different proportions:
   `codex`); you only write your own if you need a custom rollout loop. With some exceptions, any
   taskset runs under any harness.
 - **Runtime** — *where* the harness (and the taskset's tools / user simulator) executes:
-  `subprocess` / `docker` / `prime` / `modal`. **You never write one** — runtimes ship with the
+  `subprocess` / `docker` / `prime` / `modal` / `vmvm`. **You never write one** — runtimes ship with the
   framework behind one `Runtime` contract and compose with any taskset/harness; you just choose
   where code runs.
 
@@ -272,16 +272,18 @@ trace (above) or from per-rollout state set by a tool / user sim (see [State](#p
 
 ## Lifecycle hooks
 
-A rollout runs **`setup → harness → finalize → scoring`**. A taskset can hook any stage:
+A rollout runs **`setup → harness → finalize → scoring → cleanup`**. A taskset can hook any stage:
 
 | hook | signature | when | gets runtime? |
 | --- | --- | --- | --- |
 | `setup` | `(self, task, runtime)` | per-task prep before the harness (clone a repo, start a service) — the trace doesn't exist yet | ✓ |
 | `finalize` | `(self, task, trace, runtime)` | after the harness, before scoring — apply a diff, snapshot, scrape artifacts into `trace.info` | ✓ |
+| `cleanup` | `(self, task, trace, runtime)` | every rollout terminal path, before runtime teardown (`trace=None` during validation) | ✓ |
+| `close` | `(self)` | once after all evaluator rollouts and shared serving resources stop | ✗ |
 | `tools` | `(self, task) -> list[vf.Toolset]` | per task, before the harness — the task's tool servers | ✗ |
 | `user` | `(self, task) -> vf.User \| None` | per task, before the harness — the user simulator | ✗ |
 
-`setup`/`finalize` errors fail the rollout legibly (captured onto the trace, not a crash).
+`setup`/`finalize`/`cleanup` errors fail the rollout legibly (captured onto the trace, not a crash).
 
 ## Runtime access
 
@@ -298,7 +300,7 @@ isolated environment. On a `runtime` you can call:
 
 A non-zero `exit_code` is a normal result, not an exception — check it and `raise` (a plain
 Python error) yourself if it should fail the stage; the framework records a failure in your
-taskset code as a `TasksetError`. The same code works on subprocess / docker / prime / modal.
+taskset code as a `TasksetError`. The same code works on subprocess / docker / prime / modal / vmvm.
 
 A SWE taskset is the canonical case: `setup` provisions the repo, the agent edits it during the
 rollout, and a `@reward` runs the tests in the *same* runtime:
@@ -505,6 +507,15 @@ Otherwise pick a built-in, selected with `--harness.id`:
 | `mini-swe-agent` | the mini-swe-agent CLI (a minimal SWE agent) |
 | `kimi-code` | the Kimi Code CLI agent |
 
+`mini-swe-agent` defaults to its `mini` config. For benchmark-specific prompts and
+limits, select a built-in config with `--harness.config-file swebench.yaml`; append
+upstream config specs with repeated `--harness.config-overrides`, which take
+precedence over the harness defaults. The harness resolves the config from the
+selected mini-swe-agent version and merges everything into one temporary YAML, so
+the same interface also works with 1.x releases whose CLI accepts only one `-c`.
+Runs are unattended: the CLI keeps yolo execution but uses the non-interactive
+agent's terminal behavior instead of prompting when a step limit is reached.
+
 ```bash
 uv run eval gsm8k-v1 -n 1                    # default harness
 uv run eval gsm8k-v1 -n 1 --harness.id rlm   # same taskset, different driver
@@ -521,6 +532,13 @@ load instead of mis-running:
 | `SUPPORTS_USER_SIM` | `False` | drives a task's user simulator (multi-turn user injection) |
 | `SUPPORTS_MESSAGE_PROMPT` | `False` | accepts a `Messages`-list `task.prompt` (e.g. image-bearing) |
 | `APPENDS_SYSTEM_PROMPT` | `False` | emits `task.system_prompt` as a real system message (else it's folded into the user prompt with a warning) |
+| `RUNS_ON_HOST` | `False` | keeps the model/tool loop in the controller while `harness.runtime` remains the isolated task runtime |
+
+`RUNS_ON_HOST` is an advanced topology contract. Such a harness must make model calls only through
+the supplied interception `endpoint`/`secret` and explicitly use `runtime` for every task-side
+operation. Host-side harnesses currently fail closed for tasksets with MCP tools or a user simulator;
+those consumers need additional placement plumbing rather than being treated as colocated with the
+remote task runtime.
 
 ## Writing one
 
@@ -598,6 +616,10 @@ scripts share one content-addressed uv env). An agent CLI / binary is installed 
 args** (as above) rather than `OPENAI_*` env vars — an inherited or stray env var can silently
 redirect the program's model calls; `self.config.env` just supplies any extra environment.
 
+A `RUNS_ON_HOST` harness is the deliberate exception: its `launch` method owns the model loop in the
+controller process and calls `runtime.run(...)` only for sandboxed tools. The framework gives that
+loop a localhost interception endpoint and must never call the remote runtime's `host_endpoint`.
+
 ### Harness metrics
 
 A harness can define its own `@vf.metric` methods (injected `task` / `trace` / `runtime`), run over
@@ -617,10 +639,28 @@ uv run eval gsm8k-v1 -n 1 --harness.runtime.type subprocess  # local process (ev
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type docker      # local container
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type prime       # remote prime sandbox (requires auth)
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type modal       # remote modal sandbox (requires auth)
+uv run eval gsm8k-v1 -n 1 --harness.runtime.type sandoq      # remote Sandoq sandbox
+uv run eval gsm8k-v1 -n 1 --harness.runtime.type vmvm        # remote vacli VMVM
 ```
 
 A taskset that sets `NEEDS_CONTAINER` (or a task with an `image`) refuses the subprocess runtime —
-pass `docker` / `prime` / `modal`.
+pass `docker` / `prime` / `modal` / `sandoq` / `vmvm`. VMVM requires `vacli` plus the local
+`vmvm_tb_v2` package on `PYTHONPATH`; programs inside the VM reach the host interception
+server through a vacli SSH reverse forward. VMVM does not use Prime sandboxes or
+require Prime tunnel credentials.
+
+Sandoq uses the pinned provider package on `PYTHONPATH`. Its default
+`host_tunnel = "modal"` completes the host-interception direction with a
+temporary Modal reverse relay and does not require Prime credentials. Use
+`mode = "oci-runner"` for task-specific images; that mode requires the external
+OCI runner token configured by the deployment.
+
+A reference-style host-side Sandoq harness instead sets `RUNS_ON_HOST = True` and
+`host_tunnel = "none"`. This mode is accepted only with `mode = "oci-runner"`,
+`network_access = false`, exact environment `oci-runner-firecracker`, an absolute private ECR
+token path, and provider-side nested task networking set to `none`. The model loop reaches the
+local interception server directly; task setup, Bash calls, verification, and scoring still use
+the remote Sandoq runtime. Calling `SandoqRuntime.host_endpoint` in this mode is an error.
 
 ---
 

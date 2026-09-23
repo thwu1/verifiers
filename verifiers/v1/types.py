@@ -43,9 +43,7 @@ class ImageUrlContentPart(StrictBaseModel):
     image_url: ImageUrlSource
 
 
-ContentPart = Annotated[
-    TextContentPart | ImageUrlContentPart, Field(discriminator="type")
-]
+ContentPart = Annotated[TextContentPart | ImageUrlContentPart, Field(discriminator="type")]
 MessageContent = str | list[ContentPart]
 """A message body: plain text, or a list of content parts (text + images)."""
 
@@ -166,20 +164,14 @@ class Usage(StrictBaseModel):
         values = list(usages)
         if not values:
             return None
-        cached = [
-            usage.cached_input_tokens
-            for usage in values
-            if usage.cached_input_tokens is not None
-        ]
+        cached = [usage.cached_input_tokens for usage in values if usage.cached_input_tokens is not None]
         reasoning = [usage.reasoning_tokens for usage in values]
         costs = [usage.cost for usage in values]
         return cls(
             prompt_tokens=sum(usage.prompt_tokens for usage in values),
             completion_tokens=sum(usage.completion_tokens for usage in values),
             cached_input_tokens=sum(cached) if cached else None,
-            reasoning_tokens=sum(reasoning)
-            if all(v is not None for v in reasoning)
-            else None,
+            reasoning_tokens=sum(reasoning) if all(v is not None for v in reasoning) else None,
             cost=sum(costs) if all(v is not None for v in costs) else None,
         )
 
@@ -216,9 +208,7 @@ class TurnTokens(StrictBaseModel):
 
     # Transient carrier (excluded): per-message token spans into `prompt_ids` from the renderer,
     # consumed by the turn's `commit` to attribute tokens per message, then dropped.
-    message_spans: list[tuple[int, int] | None] | None = Field(
-        default=None, exclude=True
-    )
+    message_spans: list[tuple[int, int] | None] | None = Field(default=None, exclude=True)
     # Transient carrier (excluded): the renderer's multimodal sidecar (image tensors + offsets),
     # attributed per node by the turn's `commit`, then dropped — never persisted.
     multi_modal_data: MultiModalData | None = Field(default=None, exclude=True)
@@ -226,6 +216,15 @@ class TurnTokens(StrictBaseModel):
     # per token), attributed per node by the turn's `commit` into `MessageNode.routed_experts`,
     # then dropped. None unless the engine ran with `enable_return_routed_experts`.
     routed_experts: RoutedExperts | None = Field(default=None, exclude=True)
+
+
+class PendingModelIO(StrictBaseModel):
+    """Complete transient carrier from the eval client to graph commit."""
+
+    provider_route: str = Field(pattern=r"^/")
+    request_body: dict[str, Any]
+    response_body: dict[str, Any]
+    response_kind: Literal["exact_provider_json", "normalized_stream_response"]
 
 
 class Response(StrictBaseModel):
@@ -243,6 +242,8 @@ class Response(StrictBaseModel):
     """The wire response the interception server hands back to the program 1:1: the provider's
     verbatim bytes (proxy, so no field is lost) or the client's serialized completion (renderer,
     which generates and has none to relay). Transient: excluded from the trace dump."""
+    pending_model_io: PendingModelIO | None = Field(default=None, exclude=True, repr=False)
+    """Complete request/response JSON capture carried transiently to graph commit."""
 
 
 # --- sampling -----------------------------------------------------------------
@@ -255,9 +256,7 @@ class SamplingConfig(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     reasoning_effort: str | None = None
-    max_tokens: int | None = Field(
-        None, validation_alias=AliasChoices("max_tokens", "max_completion_tokens")
-    )
+    max_tokens: int | None = Field(None, validation_alias=AliasChoices("max_tokens", "max_completion_tokens"))
 
 
 Sampling = SamplingConfig

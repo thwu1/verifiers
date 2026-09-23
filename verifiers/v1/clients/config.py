@@ -12,8 +12,9 @@ import os
 from typing import Annotated, Literal
 from urllib.parse import urlparse
 
+import httpx
 from openai import AsyncOpenAI
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_config import BaseConfig
 from renderers import RendererConfig
 
@@ -34,6 +35,21 @@ class BaseClientConfig(BaseConfig):
     api_key_var: str = "PRIME_API_KEY"
     headers: dict[str, str] = Field(default_factory=dict)
     """Extra HTTP headers sent on every request."""
+    extra_headers_from_state: dict[str, str] = Field(default_factory=dict)
+    """Maps HTTP header names to rollout-state field names; the value is read from the
+    rollout state on each request (e.g. {"X-Session-ID": "trajectory_id"} for sticky
+    per-rollout routing at the inference router). Must traverse to the env server."""
+    timeout: float | None = Field(None, gt=0)
+    """Model request timeout in seconds. ``None`` leaves long generations bounded by rollout
+    timeouts instead of the HTTP client."""
+    connect_timeout: float = Field(30.0, gt=0)
+    """Timeout for opening a connection to the model endpoint."""
+    max_connections: int = Field(28000, ge=1)
+    """Maximum concurrent HTTP connections to the model endpoint."""
+    max_keepalive_connections: int = Field(28000, ge=0)
+    """Maximum idle keepalive HTTP connections to the model endpoint."""
+    max_retries: int = Field(10, ge=0)
+    """Maximum transient model-provider retries in clients that own retry policy."""
 
     @model_validator(mode="after")
     def apply_prime_config(self) -> "BaseClientConfig":
@@ -41,16 +57,12 @@ class BaseClientConfig(BaseConfig):
             return self
         prime_config = load_prime_config()
         prime_base_url = (
-            os.environ.get("PRIME_INFERENCE_URL")
-            or prime_config.get("inference_url")
-            or DEFAULT_PRIME_INFERENCE_URL
+            os.environ.get("PRIME_INFERENCE_URL") or prime_config.get("inference_url") or DEFAULT_PRIME_INFERENCE_URL
         )
         if "base_url" not in self.model_fields_set:
             self.base_url = prime_base_url
         host = urlparse(self.base_url).hostname or ""
-        if host != PRIME_INFERENCE_HOST and not host.endswith(
-            f".{PRIME_INFERENCE_HOST}"
-        ):
+        if host != PRIME_INFERENCE_HOST and not host.endswith(f".{PRIME_INFERENCE_HOST}"):
             return self
         team_id = os.environ.get("PRIME_TEAM_ID") or prime_config.get("team_id")
         if team_id:
@@ -62,6 +74,22 @@ class EvalClientConfig(BaseClientConfig):
     """The default (eval): forward each request to a matching endpoint via `EvalClient`."""
 
     type: Literal["eval"] = "eval"
+    outbound_body_denylist: list[str] = Field(default_factory=list)
+    """Top-level JSON body fields removed after dialect/model/sampling overrides and before every
+    model-turn provider request. Empty by default, preserving generic relay behavior. Auxiliary
+    protocol calls such as token counting are not model turns and remain verbatim."""
+    capture_model_io: bool = False
+    """Persist the exact outbound request JSON and provider response JSON on sampled nodes."""
+
+    @field_validator("outbound_body_denylist")
+    @classmethod
+    def validate_outbound_body_denylist(cls, value: list[str]) -> list[str]:
+        if "stream" in value:
+            raise ValueError(
+                "outbound_body_denylist cannot remove 'stream': the caller's response "
+                "transport is selected before provider forwarding"
+            )
+        return list(dict.fromkeys(value))
 
 
 class TrainClientConfig(BaseClientConfig):
@@ -83,9 +111,17 @@ class TrainClientConfig(BaseClientConfig):
 
 
 # Discriminated union for a CLI-selectable client (`--client.type eval|train`).
-ClientConfig = Annotated[
-    EvalClientConfig | TrainClientConfig, Field(discriminator="type")
-]
+ClientConfig = Annotated[EvalClientConfig | TrainClientConfig, Field(discriminator="type")]
+
+
+def _http_client(config: BaseClientConfig) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(config.timeout, connect=config.connect_timeout),
+        limits=httpx.Limits(
+            max_connections=config.max_connections,
+            max_keepalive_connections=config.max_keepalive_connections,
+        ),
+    )
 
 
 def resolve_client(config: BaseClientConfig) -> Client:
@@ -104,6 +140,8 @@ def resolve_client(config: BaseClientConfig) -> Client:
             base_url=config.base_url,
             api_key=api_key,
             default_headers=config.headers or None,
+            max_retries=config.max_retries,
+            http_client=_http_client(config),
         )
         return TrainClient(
             openai,
@@ -112,4 +150,14 @@ def resolve_client(config: BaseClientConfig) -> Client:
             renderer_model_name=config.renderer_model_name,
         )
     # The proxy is a raw httpx forwarder; the dialect supplies the auth scheme + upstream path.
-    return EvalClient(config.base_url, api_key, headers=config.headers or None)
+    return EvalClient(
+        config.base_url,
+        api_key,
+        headers=config.headers or None,
+        outbound_body_denylist=getattr(config, "outbound_body_denylist", []),
+        capture_model_io=getattr(config, "capture_model_io", False),
+        timeout=config.timeout,
+        connect_timeout=config.connect_timeout,
+        max_connections=config.max_connections,
+        max_keepalive_connections=config.max_keepalive_connections,
+    )

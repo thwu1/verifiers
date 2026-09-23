@@ -18,22 +18,23 @@ from typing import Annotated, Literal
 from pydantic import Field, SerializeAsAny, model_validator
 from pydantic_config import BaseConfig
 
-from verifiers.v1.harness import HarnessConfig
 from verifiers.v1.clients import RolloutContext
 from verifiers.v1.decorators import discover_decorated
 from verifiers.v1.episode import Episode
-from verifiers.v1.types import EnvId
+from verifiers.v1.harness import HarnessConfig
 from verifiers.v1.interception import InterceptionPool, RolloutLimits
+from verifiers.v1.mcp import serve_shared
 from verifiers.v1.retries import RetryConfig
 from verifiers.v1.rollout import Rollout
 from verifiers.v1.runtimes import (
     RuntimeConfig,
+    SandoqConfig,
     SubprocessConfig,
     runtime_is_local,
 )
 from verifiers.v1.task import Task
 from verifiers.v1.taskset import TasksetConfig
-from verifiers.v1.mcp import serve_shared
+from verifiers.v1.types import EnvId
 
 
 class TimeoutConfig(BaseConfig):
@@ -106,13 +107,13 @@ class EnvConfig(BaseConfig):
     capping is a framework concern, never an harness or task field."""
     max_input_tokens: int | None = None
     """Max input (prompt) tokens per rollout (None = no limit). Caps the trace's
-    `prompt_len`; framework-enforced between turns."""
+    `prompt_len`; checked before a response is committed."""
     max_output_tokens: int | None = None
     """Max output (completion) tokens per rollout (None = no limit). Caps the trace's
-    `completion_len`; framework-enforced between turns."""
+    `completion_len`; also clamps each model call's generation budget."""
     max_total_tokens: int | None = None
-    """Max total (prompt + completion) tokens per rollout (None = no limit). Caps the
-    trace's `total_tokens`; framework-enforced between turns."""
+    """Max total prompt + completion tokens in any persisted branch (None = no limit).
+    Also clamps each model call's generation budget."""
     multiplex: int = Field(32, ge=1)
     """Rollouts that share one interception server (and, behind a remote runtime, one
     tunnel). N concurrent rollouts use ~N/multiplex servers + tunnels instead of one each —
@@ -199,7 +200,7 @@ def resolve_runtime_config(
         if isinstance(config, SubprocessConfig):
             raise ValueError(
                 f"task {task.idx!r} requires image {task.image!r}, but the subprocess "
-                "runtime has no container; use the docker or prime runtime"
+                "runtime has no container; use docker, prime, modal, or vmvm"
             )
         updates["image"] = task.image
     workdir_spec = type(config).model_fields.get("workdir")
@@ -236,6 +237,22 @@ class Environment:
         self.config = config
         self.taskset = load_taskset(config.taskset)
         self.harness = load_harness(config.harness)
+        runtime_config = self.harness.config.runtime
+        if isinstance(runtime_config, SandoqConfig) and self.harness.RUNS_ON_HOST != (
+            runtime_config.host_tunnel == "none"
+        ):
+            raise ValueError(
+                "a Sandoq host-side harness requires host_tunnel='none', while a "
+                "runtime-side harness must configure a host tunnel"
+            )
+        if self.harness.RUNS_ON_HOST and (
+            type(self.taskset).tools is not Taskset.tools
+            or type(self.taskset).user is not Taskset.user
+        ):
+            raise ValueError(
+                "host-side harnesses currently require a taskset without MCP tools or "
+                "a user simulator"
+            )
         if (
             not self.harness.SUPPORTS_MCP
             and type(self.taskset).tools is not Taskset.tools
@@ -260,7 +277,7 @@ class Environment:
             raise ValueError(
                 f"Taskset {self.taskset.config.id!r} needs a container runtime "
                 "(NEEDS_CONTAINER), but the harness runs on the subprocess runtime; "
-                "use --harness.runtime.type docker or prime."
+                "use --harness.runtime.type docker, prime, modal, or vmvm."
             )
         if self.harness.config.id != "default" and isinstance(
             self.harness.config.runtime, SubprocessConfig
@@ -268,7 +285,7 @@ class Environment:
             logger.warning(
                 "Harness %r is running in the subprocess runtime on the local system. "
                 "Local files and settings may affect the evaluation; use subprocess only "
-                "for debugging. Use --harness.runtime.type docker or prime for an isolated "
+                "for debugging. Use --harness.runtime.type docker, prime, modal, or vmvm for an isolated "
                 "run.",
                 self.harness.config.id,
             )
@@ -368,24 +385,31 @@ class Environment:
         every `episode()` built inside this context injects them into its rollouts — that's
         what keeps both eval runners (in-process and env-server) on one serving path. Build
         episodes inside this context; the resources are torn down on exit."""
-        async with (
-            self.shared_tools(tasks) as shared_urls,
-            self.interception_pool() as interception,
-        ):
-            self._shared_urls = shared_urls
-            self._interception = interception
-            try:
-                yield
-            finally:
-                self._shared_urls = {}
-                self._interception = None
+        try:
+            async with (
+                self.shared_tools(tasks) as shared_urls,
+                self.interception_pool() as interception,
+            ):
+                self._shared_urls = shared_urls
+                self._interception = interception
+                try:
+                    yield
+                finally:
+                    self._shared_urls = {}
+                    self._interception = None
+        finally:
+            await self.taskset.close()
 
     def interception_pool(self) -> InterceptionPool:
         """The shared interception pool for this env's rollouts — one server (+ tunnel
         behind a remote runtime) per `multiplex` rollouts, grown on demand. Built here,
         where the harness runtime and `multiplex` live; the caller (eval runner / env
         server) enters it for the run and tears it down. Pass it to `Episode.run`."""
-        return InterceptionPool(self.harness.config.runtime, self.config.multiplex)
+        return InterceptionPool(
+            self.harness.config.runtime,
+            self.config.multiplex,
+            consumer_runs_on_host=self.harness.RUNS_ON_HOST,
+        )
 
     @contextlib.asynccontextmanager
     async def shared_tools(self, tasks: list[Task]):
@@ -400,6 +424,8 @@ class Environment:
         if not any(server.config.shared for server in servers):
             yield {}
             return
-        harness_is_local = runtime_is_local(self.harness.config.runtime)
+        harness_is_local = self.harness.RUNS_ON_HOST or runtime_is_local(
+            self.harness.config.runtime
+        )
         async with serve_shared(servers, harness_is_local=harness_is_local) as urls:
             yield urls

@@ -227,12 +227,18 @@ class OpenAIChatCompletionsClient(
                     ]
                 else:
                     oai_tool_calls = None
-                return ChatCompletionAssistantMessageParam(
+                asst_msg = ChatCompletionAssistantMessageParam(
                     role="assistant",
                     content=cast(Any, normalize_content(message.content)),
                     tool_calls=cast(Any, oai_tool_calls),
                     reasoning_content=message.reasoning_content,  # type: ignore[arg-type]
                 )
+                # Some vLLM builds drop the non-standard `reasoning_content` field on input
+                # but honor `reasoning`; mirror it so prior-turn thinking is actually replayed
+                # into the prompt (kept in sync; empty-guarded to avoid rendering a literal None).
+                if message.reasoning_content:
+                    asst_msg["reasoning"] = message.reasoning_content  # type: ignore[typeddict-unknown-key]
+                return asst_msg
             elif isinstance(message, ToolMessage):
                 return ChatCompletionToolMessageParam(
                     role="tool",

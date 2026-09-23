@@ -99,18 +99,14 @@ def dataset_dir(dataset: str) -> Path:
     else:
         uv_bin = shutil.which("uv")
         if uv_bin is None:
-            raise RuntimeError(
-                "Harbor datasets require an installed `harbor` CLI or `uv` for automatic installation"
-            )
+            raise RuntimeError("Harbor datasets require an installed `harbor` CLI or `uv` for automatic installation")
         logger.info("harbor: installing %s with uv", HARBOR_PACKAGE)
         command = [uv_bin, "tool", "run"]
         # Harbor requires Python 3.12, while Verifiers also supports Python 3.11.
         if sys.version_info[:2] == (3, 11):
             command.extend(["--python", "3.12"])
         command.extend(["--from", HARBOR_PACKAGE, "harbor"])
-    subprocess.run(
-        [*command, "download", dataset, "--export", "-o", str(out)], check=True
-    )
+    subprocess.run([*command, "download", dataset, "--export", "-o", str(out)], check=True)
     return out
 
 
@@ -120,7 +116,7 @@ def resolve_image(
     require_image: bool,
     ignore_dockerfile: bool = False,
 ) -> str | None:
-    """The task's declared registry image (usable by docker or prime). A pullable
+    """The task's declared registry image (usable by any container runtime). A pullable
     `[environment].docker_image` is used directly. A task whose environment is a
     `Dockerfile` is rejected — we don't build Dockerfiles, and running it on the default
     image would silently score against the wrong environment (e.g. SWE-bench's `/testbed`
@@ -140,9 +136,7 @@ def resolve_image(
             "Pass --taskset.ignore-dockerfile to run it on the harness runtime's image instead."
         )
     if require_image:
-        raise ValueError(
-            f"{task_dir.name}: no [environment].docker_image and require_image=True"
-        )
+        raise ValueError(f"{task_dir.name}: no [environment].docker_image and require_image=True")
     return None
 
 
@@ -178,16 +172,10 @@ def parse_task(task_dir: Path, idx: int, harbor_config: HarborConfig) -> HarborT
             harbor_config.ignore_dockerfile,
         ),
         timeout=TaskTimeout(
-            harness=harness_timeout * harbor_config.timeout_multiplier
-            if harness_timeout is not None
-            else None,
-            scoring=scoring_timeout * harbor_config.timeout_multiplier
-            if scoring_timeout is not None
-            else None,
+            harness=harness_timeout * harbor_config.timeout_multiplier if harness_timeout is not None else None,
+            scoring=scoring_timeout * harbor_config.timeout_multiplier if scoring_timeout is not None else None,
         ),
-        resources=parse_resources(
-            config.get("environment", {}), harbor_config.resource_multiplier
-        ),
+        resources=parse_resources(config.get("environment", {}), harbor_config.resource_multiplier),
         keywords=task.get("keywords", []),
         authors=authors,
         difficulty=meta.get("difficulty"),
@@ -216,16 +204,11 @@ class HarborTaskset(Taskset[HarborTask, HarborConfig]):
             toml_path.parent
             for toml_path in sorted(root.rglob("task.toml"))
             if (toml_path.parent / "instruction.md").is_file()
-            and (
-                self.config.tasks is None or toml_path.parent.name in self.config.tasks
-            )
+            and (self.config.tasks is None or toml_path.parent.name in self.config.tasks)
         ]
         if not task_dirs:
             raise ValueError(f"no harbor tasks found in {root}")
-        return [
-            parse_task(task_dir, idx, self.config)
-            for idx, task_dir in enumerate(task_dirs)
-        ]
+        return [parse_task(task_dir, idx, self.config) for idx, task_dir in enumerate(task_dirs)]
 
     @reward(weight=1.0)
     async def solved(self, task: HarborTask, trace: Trace, runtime: Runtime) -> float:

@@ -46,6 +46,7 @@ from verifiers.parsers.parser import Parser
 from verifiers.rubrics.rubric import Rubric
 from verifiers.serve import EnvClient
 from verifiers.types import (
+    GROUP_ROLLOUT_SLOT_INFO_KEY,
     ClientConfig,
     DatasetBuilder,
     GenerateMetadata,
@@ -703,6 +704,26 @@ class Environment(ABC):
             for input in group_inputs
         ]
         group_states = await asyncio.gather(*rollout_tasks)
+
+        for rollout_slot, state in enumerate(group_states):
+            info = state.get("info")
+            if info is None:
+                info = {}
+                state["info"] = info
+            if not isinstance(info, dict):
+                raise TypeError("state.info must be a dictionary before group scoring")
+            existing_slot = info.get(GROUP_ROLLOUT_SLOT_INFO_KEY)
+            if existing_slot is not None:
+                if (
+                    isinstance(existing_slot, bool)
+                    or not isinstance(existing_slot, int)
+                    or existing_slot != rollout_slot
+                ):
+                    raise ValueError(
+                        f"Reserved {GROUP_ROLLOUT_SLOT_INFO_KEY} conflicts with group position: "
+                        f"{existing_slot!r} != {rollout_slot}"
+                    )
+            info[GROUP_ROLLOUT_SLOT_INFO_KEY] = rollout_slot
 
         start_scoring = time.time()
         for state in group_states:

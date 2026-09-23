@@ -18,7 +18,6 @@ from pydantic_config import BaseConfig
 from verifiers.v1.clients import RolloutContext
 from verifiers.v1.decorators import discover_decorated, invoke
 from verifiers.v1.errors import HarnessError, boundary
-from verifiers.v1.utils.install import env_name
 from verifiers.v1.runtimes import (
     ProgramResult,
     Runtime,
@@ -28,6 +27,7 @@ from verifiers.v1.runtimes import (
 from verifiers.v1.task import Task
 from verifiers.v1.trace import Trace
 from verifiers.v1.types import EnvId, Messages
+from verifiers.v1.utils.install import env_name
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +43,12 @@ class HarnessConfig(BaseConfig):
     `org/name[@version]` package installed on demand from the Environments Hub (see
     `EnvId`). Set via `--harness.id`."""
     runtime: RuntimeConfig = SubprocessConfig()
-    """Where the harness runs (subprocess / docker / prime). Subprocess by default — a local
+    """Where the harness runs (subprocess / docker / prime / modal / vmvm). Subprocess by default — a local
     process on the host; a taskset that needs a container (its own image, or NEEDS_CONTAINER)
-    selects `--harness.runtime.type docker` (or prime/modal). Lives on the harness — it's the
-    harness's box; tool servers have their own placement (see `TasksetConfig.tools`)."""
+    selects `--harness.runtime.type docker` (or another container runtime). Lives on the harness — it's the
+    harness's box; tool servers have their own placement (see `TasksetConfig.tools`). A harness
+    with ``RUNS_ON_HOST`` keeps its model loop in the controller and uses this as the task/tool
+    runtime instead."""
     env: dict[str, str] = Field(default_factory=dict)
     """Additional environment variables for the harness program. Harness-owned endpoint,
     authentication, and model variables take precedence."""
@@ -74,6 +76,11 @@ class Harness(ABC, Generic[ConfigT]):
     """Drive a task's user simulator (multi-turn user injection); opt in per harness."""
     SUPPORTS_MESSAGE_PROMPT: ClassVar[bool] = False
     """Accept a Messages-list task.prompt (e.g. an image-bearing prompt); opt in per harness."""
+    RUNS_ON_HOST: ClassVar[bool] = False
+    """The model/tool loop executes in the controller process, while ``runtime`` remains the
+    task sandbox. Host-side harnesses use the local interception endpoint and call runtime
+    methods explicitly for tool execution; ordinary harnesses launch their program in the
+    runtime and leave this false."""
 
     def __init__(self, config: ConfigT) -> None:
         self.config = config
@@ -93,8 +100,7 @@ class Harness(ABC, Generic[ConfigT]):
             and not self.SUPPORTS_MESSAGE_PROMPT
         ):
             raise ValueError(
-                f"Harness {self.config.id!r} does not support a Messages prompt; "
-                "task.prompt must be a string or None."
+                f"Harness {self.config.id!r} does not support a Messages prompt; task.prompt must be a string or None."
             )
         system = task.system_prompt
         if system is None or self.APPENDS_SYSTEM_PROMPT:
@@ -106,8 +112,7 @@ class Harness(ABC, Generic[ConfigT]):
                 "APPENDS_SYSTEM_PROMPT to emit it as a system message."
             )
         logger.warning(
-            "Harness %r does not support a separate system prompt; prepending "
-            "task.system_prompt to the user prompt.",
+            "Harness %r does not support a separate system prompt; prepending task.system_prompt to the user prompt.",
             self.config.id,
         )
         return None, f"{system}\n\n{prompt}"

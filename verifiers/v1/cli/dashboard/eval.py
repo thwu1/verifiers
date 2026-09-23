@@ -18,13 +18,13 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from verifiers.utils.pricing_utils import format_cost_usd
 from verifiers.v1.cli.dashboard.base import live_view
 from verifiers.v1.cli.output import output_path
 from verifiers.v1.configs.eval import EvalConfig
 from verifiers.v1.rollout import Phase, Rollout
 from verifiers.v1.trace import Trace
 from verifiers.v1.utils.format import format_count, format_mean, format_time
-from verifiers.utils.pricing_utils import format_cost_usd
 
 # For sizing pages to the terminal: detects the real terminal height/width each access (the live
 # view writes to the same terminal). Reused so we don't rebuild it every refresh tick.
@@ -63,9 +63,7 @@ def _limits(config: EvalConfig) -> list[str]:
     if config.max_total_tokens:
         toks.append(f"total≤{config.max_total_tokens}")
     return [
-        f"≤{config.max_concurrent} concurrent"
-        if config.max_concurrent
-        else "no concurrency cap",
+        f"≤{config.max_concurrent} concurrent" if config.max_concurrent else "no concurrency cap",
         f"{config.max_turns} turns" if config.max_turns else "no turn cap",
         f"{', '.join(toks)} tokens" if toks else "no token cap",
     ]
@@ -75,9 +73,7 @@ def _timeouts(config: EvalConfig) -> list[str]:
     """Per-stage rollout timeouts for the overview, each stage enumerated (unset → 'no <stage>
     timeout')."""
     return [
-        f"{stage} {v:g}s"
-        if (v := getattr(config.timeout, stage))
-        else f"no {stage} timeout"
+        f"{stage} {v:g}s" if (v := getattr(config.timeout, stage)) else f"no {stage} timeout"
         for stage in ("setup", "rollout", "finalize", "scoring")
     ]
 
@@ -90,11 +86,7 @@ def _aligned(rows: list[list[str]]) -> list[str]:
         for i, seg in enumerate(row):
             widths[i] = max(widths.get(i, 0), len(seg))
     return [
-        "  ·  ".join(
-            seg.ljust(widths[i]) if i < len(row) - 1 else seg
-            for i, seg in enumerate(row)
-        )
-        for row in rows
+        "  ·  ".join(seg.ljust(widths[i]) if i < len(row) - 1 else seg for i, seg in enumerate(row)) for row in rows
     ]
 
 
@@ -104,7 +96,7 @@ def _warning(config: EvalConfig) -> Text | None:
     if config.harness.id != "default" and config.harness.runtime.type == "subprocess":
         return Text(
             "warning  Runs on the local system; local files and settings may affect this "
-            "evaluation. Use subprocess only for debugging, or use docker or prime for an "
+            "evaluation. Use subprocess only for debugging, or use a container runtime for an "
             "isolated run.",
             style="yellow",
         )
@@ -112,9 +104,7 @@ def _warning(config: EvalConfig) -> Text | None:
 
 
 def Overview(config: EvalConfig) -> Table:
-    sampling = ", ".join(
-        f"{k}={v}" for k, v in config.sampling.model_dump(exclude_none=True).items()
-    )
+    sampling = ", ".join(f"{k}={v}" for k, v in config.sampling.model_dump(exclude_none=True).items())
     grid = Table.grid(padding=(0, 2))
     grid.add_column(style="dim")
     grid.add_column()
@@ -131,18 +121,13 @@ def Overview(config: EvalConfig) -> Table:
     return grid
 
 
-def Progress(
-    rollouts: list[Rollout], start: float, page: tuple[int, int] | None = None
-) -> Group:
+def Progress(rollouts: list[Rollout], start: float, page: tuple[int, int] | None = None) -> Group:
     done = [r.trace for r in rollouts if r.phase == Phase.DONE]  # fully scored
     # Headline reward = mean over non-errored; when any errored, `format_mean` appends the
     # global avg (errored count as 0) in parens. `err` is the share that errored.
     reward = format_mean(done, lambda t: t.reward)
     err = f"{sum(t.has_error for t in done) / len(done):.2f}" if done else "—"
-    stats = (
-        f"{len(done)}/{len(rollouts)} · {format_time(time.time() - start)} · "
-        f"reward {reward} · err {err}"
-    )
+    stats = f"{len(done)}/{len(rollouts)} · {format_time(time.time() - start)} · reward {reward} · err {err}"
     if page is not None:  # rollouts overflow the screen — show which page is on screen
         stats += f"  (page {page[0]}/{page[1]})"
     row = Table.grid(expand=True, padding=(0, 1))
@@ -177,8 +162,7 @@ def _breakdown(done: list[Trace]) -> Table | None:
         if not names:
             continue
         segments = [
-            f"{name} {format_mean(done, lambda t, n=name, s=source: getattr(t, s).get(n, 0.0))}"
-            for name in names
+            f"{name} {format_mean(done, lambda t, n=name, s=source: getattr(t, s).get(n, 0.0))}" for name in names
         ]
         grid.add_row(label, "  ·  ".join(segments))
     return grid if grid.row_count else None
@@ -241,16 +225,12 @@ def Rows(groups: list[list[Rollout]], now: float, runtime_type: str) -> Table:
                     stop = ""  # error shown instead
                 else:
                     stop = t.stop_condition or ""
-                    if (
-                        t.is_truncated
-                    ):  # flag a clipped rollout next to its stop condition
+                    if t.is_truncated:  # flag a clipped rollout next to its stop condition
                         stop = f"{stop} (truncated)".strip()
             else:
                 state, result, stop = rollout.phase, "", ""
             label = f"name={t.task.name[:32]}" if t.task.name else f"idx={t.task.idx}"
-            descriptor = (
-                rollout.runtime.descriptor if rollout.runtime is not None else None
-            )
+            descriptor = rollout.runtime.descriptor if rollout.runtime is not None else None
             runtime = f"{runtime_type}({descriptor})" if descriptor else runtime_type
             turns = t.num_turns
             start = t.timing.setup.start
@@ -318,9 +298,7 @@ def Rows(groups: list[list[Rollout]], now: float, runtime_type: str) -> Table:
     return grid
 
 
-def _paginate(
-    groups: list[list[Rollout]], rows_per_page: int, now: float
-) -> tuple[list[list[Rollout]], int, int]:
+def _paginate(groups: list[list[Rollout]], rows_per_page: int, now: float) -> tuple[list[list[Rollout]], int, int]:
     """Pack groups (a task's rollouts kept together) into pages of at most `rows_per_page` rows,
     cycling to the next page every `_PAGE_SECONDS`. Returns (this page's groups, 0-based index,
     page count) — a single page when everything already fits."""

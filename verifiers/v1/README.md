@@ -11,7 +11,7 @@ tighter type contract. `import verifiers.v1 as vf`.
   harness (the program driving the rollout); any taskset runs under any harness
   (`default` / `rlm` / `codex` / your own)
 - **Swappable runtime** — the harness, tools, and user simulators all run behind one
-  `Runtime` contract, in `subprocess` / `docker` / `prime` / `modal` / ...
+  `Runtime` contract, in `subprocess` / `docker` / `prime` / `modal` / `sandoq` / `vmvm` / ...
 - **First-class branching rollouts** — a rollout isn't assumed linear: context compaction and
   subagents are native. Each branch (a root→leaf path through the trace graph) is its own
   training sample, so a compacting or multi-agent rollout trains end to end.
@@ -117,6 +117,8 @@ uv run eval gsm8k-v1 -n 1 --harness.runtime.type subprocess  # local process (de
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type docker      # local container (requires local docker)
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type prime       # remote prime sandbox (requires auth)
 uv run eval gsm8k-v1 -n 1 --harness.runtime.type modal       # remote modal sandbox (requires auth)
+uv run eval gsm8k-v1 -n 1 --harness.runtime.type sandoq      # remote Sandoq sandbox
+uv run eval gsm8k-v1 -n 1 --harness.runtime.type vmvm        # remote vacli VMVM
 ```
 
 The framework manages each runtime's full lifecycle — provisioning through

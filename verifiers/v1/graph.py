@@ -24,9 +24,16 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from pydantic import ConfigDict, Field, field_serializer, field_validator
+from pydantic import ConfigDict, Field, field_serializer, field_validator, model_validator
 from renderers.base import MultiModalData, PlaceholderRange, RenderedTokens
 
+from verifiers.v1.model_io import (
+    ModelIO,
+    capture_model_request,
+    capture_model_response,
+    clone_json_object,
+    reconstruct_model_request,
+)
 from verifiers.v1.types import (
     AssistantMessage,
     FinishReason,
@@ -83,8 +90,8 @@ class MessageNode(StrictBaseModel):
     assistant node's completion span); False for template scaffold and every input-message
     token."""
     logprobs: list[float] = Field(default_factory=list)
-    """Sampling logprobs for the sampled tokens — length equals the number of True entries in
-    `mask`; empty for input messages."""
+    """Sampling logprobs for the sampled tokens when requested — length equals the number of
+    True entries in `mask`; empty for input messages and provider runs without logprobs."""
     finish_reason: FinishReason = None
     """The response's finish reason (assistant nodes only) — kept for truncation detection."""
     multi_modal_data: MultiModalData | None = None
@@ -96,6 +103,8 @@ class MessageNode(StrictBaseModel):
     usage: Usage | None = None
     """Provider-reported token usage for this message's response (assistant nodes). Preserved
     on the wire and on disk, including cache-read tokens when the provider reports them."""
+    model_io: ModelIO | None = None
+    """Optional exact provider request/response capture for this sampled assistant turn."""
     routed_experts: np.ndarray | None = None
     """This node's slice of the MoE expert-routing array — uint8 `[len(token_ids), layers,
     top_k]`, the expert ids inference selected for exactly this node's tokens. Attributed from
@@ -104,6 +113,12 @@ class MessageNode(StrictBaseModel):
     a raw-bytes `__nd__` dict; kept off disk by the dump-site `exclude` in prime-rl."""
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def validate_model_io_provenance(self) -> "MessageNode":
+        if self.model_io is not None and (not self.sampled or not isinstance(self.message, AssistantMessage)):
+            raise ValueError("model_io belongs only on sampled assistant nodes")
+        return self
 
     @field_serializer("multi_modal_data")
     def serialize_multi_modal_data(self, mmd: MultiModalData | None) -> dict | None:
@@ -118,9 +133,7 @@ class MessageNode(StrictBaseModel):
                 for modality, ranges in mmd.mm_placeholders.items()
             },
             "mm_items": {
-                modality: [
-                    {k: _encode_ndarray(v) for k, v in item.items()} for item in items
-                ]
+                modality: [{k: _encode_ndarray(v) for k, v in item.items()} for item in items]
                 for modality, items in mmd.mm_items.items()
             },
         }
@@ -135,16 +148,11 @@ class MessageNode(StrictBaseModel):
         return MultiModalData(
             mm_hashes={k: list(v) for k, v in (value.get("mm_hashes") or {}).items()},
             mm_placeholders={
-                modality: [
-                    PlaceholderRange(offset=p["offset"], length=p["length"])
-                    for p in ranges
-                ]
+                modality: [PlaceholderRange(offset=p["offset"], length=p["length"]) for p in ranges]
                 for modality, ranges in (value.get("mm_placeholders") or {}).items()
             },
             mm_items={
-                modality: [
-                    {k: _decode_ndarray(v) for k, v in item.items()} for item in items
-                ]
+                modality: [{k: _decode_ndarray(v) for k, v in item.items()} for item in items]
                 for modality, items in (value.get("mm_items") or {}).items()
             },
         )
@@ -218,10 +226,7 @@ def message_hash(message: Message) -> str:
 def _head_index(trace: Trace) -> dict[tuple[int | None, str], int]:
     """`(parent, msg_hash) -> node_id`, rebuilt lazily from `nodes` after deserialization."""
     if not trace._head_index and trace.nodes:
-        trace._head_index = {
-            (node.parent, message_hash(node.message)): nid
-            for nid, node in enumerate(trace.nodes)
-        }
+        trace._head_index = {(node.parent, message_hash(node.message)): nid for nid, node in enumerate(trace.nodes)}
     return trace._head_index
 
 
@@ -248,6 +253,27 @@ class PendingTurn:
         return self.prompt[self.tail_start :]
 
     @property
+    def accounted_path_len(self) -> int:
+        """Best known token length of the reused prefix.
+
+        Exact token arrays on the latest sampled turn are authoritative. Eval
+        providers may intentionally omit them; only then is that turn's
+        provider usage used as a conservative fallback. ``max`` preserves any
+        exact prefix already stored by an earlier turn in a mixed trace.
+        """
+        for node_id in reversed(self.prefix_node_ids):
+            node = self.trace.nodes[node_id]
+            if not node.sampled:
+                continue
+            if node.token_ids or node.mask:
+                return self.path_len
+            return max(
+                self.path_len,
+                node.usage.total_tokens if node.usage is not None else 0,
+            )
+        return self.path_len
+
+    @property
     def parent(self) -> int | None:
         return self.prefix_node_ids[-1] if self.prefix_node_ids else None
 
@@ -262,9 +288,7 @@ class PendingTurn:
         last = self.trace.nodes[self.prefix_node_ids[-1]]
         if not last.sampled:
             return None
-        first_sampled = next(
-            (i for i, sampled in enumerate(last.mask) if sampled), None
-        )
+        first_sampled = next((i for i, sampled in enumerate(last.mask) if sampled), None)
         if first_sampled is None:
             return None
         if any(not sampled for sampled in last.mask[first_sampled:]):
@@ -280,9 +304,7 @@ class PendingTurn:
             return None
         return prompt_ids, completion_ids
 
-    def prompt_message_spans(
-        self, tail_attribution: RenderedTokens
-    ) -> list[tuple[int, int] | None]:
+    def prompt_message_spans(self, tail_attribution: RenderedTokens) -> list[tuple[int, int] | None]:
         """Convert bridge-tail attribution into full-prompt message spans."""
         # Reused bridge tokens are unattributed, so scan only the newly rendered tail.
         tail_spans = RenderedTokens(
@@ -291,8 +313,7 @@ class PendingTurn:
         ).message_token_spans()
         # Tail spans are slice-relative; restore their full-prompt token offsets.
         return [None] * self.tail_start + [
-            None if span is None else (span[0] + self.path_len, span[1] + self.path_len)
-            for span in tail_spans
+            None if span is None else (span[0] + self.path_len, span[1] + self.path_len) for span in tail_spans
         ]
 
     def commit(self, response: Response) -> None:
@@ -307,16 +328,8 @@ def prepare_turn(trace: Trace, prompt: list[Message]) -> PendingTurn:
     prefix_node_ids: list[int] = []
     for msg in prompt:
         existing = None
-        if (
-            isinstance(msg.content, list)
-            and len(idx) <= 10
-            and any(part.type == "image_url" for part in msg.content)
-        ):
-            children = [
-                node_id
-                for (node_parent, _), node_id in idx.items()
-                if node_parent == parent
-            ]
+        if isinstance(msg.content, list) and len(idx) <= 10 and any(part.type == "image_url" for part in msg.content):
+            children = [node_id for (node_parent, _), node_id in idx.items() if node_parent == parent]
             # Repeated image URLs are cheaper to compare than to encode and hash again.
             # Only scan short, unambiguous parents; all other cases use the stable index.
             if len(children) == 1 and trace.nodes[children[0]].message == msg:
@@ -378,9 +391,7 @@ def _attribute_mm(
             if k < len(hashes):
                 node_hashes.setdefault(modality, []).append(hashes[k])
         if node_items:
-            trace.nodes[node_id].multi_modal_data = MultiModalData(
-                mm_items=node_items, mm_hashes=node_hashes
-            )
+            trace.nodes[node_id].multi_modal_data = MultiModalData(mm_items=node_items, mm_hashes=node_hashes)
 
 
 def _attribute_routed_experts(
@@ -411,9 +422,7 @@ def _attribute_routed_experts(
         elif n and arr.shape[0] and 0 <= off and end == needed == arr.shape[0] + 1:
             # The engine omits the turn's final position because no forward pass follows it.
             # Pad only the final node's suffix instead of copying the full-context array.
-            trace.nodes[nid].routed_experts = np.concatenate(
-                [arr[off:], arr[-1:]], axis=0
-            )
+            trace.nodes[nid].routed_experts = np.concatenate([arr[off:], arr[-1:]], axis=0)
         off = end
 
 
@@ -498,6 +507,29 @@ def _commit_turn(turn: PendingTurn, response: Response) -> None:
     comp_ids = tokens.completion_ids if tokens else []
     gen_start = path_len if cursor is None else cursor
     gen_prompt = prompt_ids[gen_start:]
+    captured_model_io = None
+    request_body = None
+    if response.pending_model_io is not None:
+        base_node = parent
+        while base_node is not None and trace.nodes[base_node].model_io is None:
+            base_node = trace.nodes[base_node].parent
+        base_body = None
+        if base_node is not None:
+            cached = trace._model_request_cache
+            base_body = (
+                cached[1]
+                if cached is not None and cached[0] == base_node
+                else reconstruct_model_request(trace.nodes, base_node)
+            )
+        request_body = clone_json_object(response.pending_model_io.request_body)
+        captured_model_io = ModelIO(
+            provider_route=response.pending_model_io.provider_route,
+            request=capture_model_request(request_body, base_node=base_node, base_body=base_body),
+            response=capture_model_response(
+                response.pending_model_io.response_body,
+                kind=response.pending_model_io.response_kind,
+            ),
+        )
     trace.nodes.append(
         MessageNode.model_construct(
             parent=parent,
@@ -509,6 +541,7 @@ def _commit_turn(turn: PendingTurn, response: Response) -> None:
             logprobs=tokens.completion_logprobs if tokens else [],
             finish_reason=response.finish_reason,
             usage=response.usage,
+            model_io=captured_model_io,
         )
     )
     # Register the assistant so the next turn's prompt (which restates it) reuses this node.
@@ -516,15 +549,16 @@ def _commit_turn(turn: PendingTurn, response: Response) -> None:
     idx[(parent, message_hash(response.message))] = assistant_id
     new_node_ids.append(assistant_id)
 
+    if request_body is not None:
+        trace._model_request_cache = (assistant_id, request_body)
+
     # Attribute this turn's images onto the input nodes that introduced them (by content part).
     if mm_path is not None:
         _attribute_mm(trace, mm_path, num_reused, multi_modal_data)
 
     # Attribute this turn's expert-routing array onto the nodes created this turn (new input
     # nodes in creation order, then the assistant node), each getting the routing for its tokens.
-    _attribute_routed_experts(
-        trace, new_node_ids, path_len, tokens.routed_experts if tokens else None
-    )
+    _attribute_routed_experts(trace, new_node_ids, path_len, tokens.routed_experts if tokens else None)
 
 
 # --- walking the graph (views) ---------------------------------------------------------

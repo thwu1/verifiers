@@ -48,6 +48,8 @@ _ENSURE_UV = (
     f"{{ {_INSTALL_CURL}; {_DOWNLOAD_UV}; }} "
     "|| pip install -q -U uv 2>/dev/null"
 )
+_UV_PREPARE_RETRIES = 2
+_UV_PREPARE_ERROR_OUTPUT_LIMIT = 2000
 
 # The single port a self-publishing runtime (modal/prime) forwards to a public URL for a server
 # hosted in its sandbox. A server placed in such a runtime binds this (on 0.0.0.0) and is reached
@@ -60,6 +62,23 @@ class ProgramResult:
     exit_code: int
     stdout: str
     stderr: str
+
+
+def _program_failure_detail(result: ProgramResult, limit: int = _UV_PREPARE_ERROR_OUTPUT_LIMIT) -> str:
+    """Bounded stdout + stderr for runtimes that expose either or both streams."""
+    streams: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, output in (("stdout", result.stdout), ("stderr", result.stderr)):
+        output = output.strip()
+        if output and output not in seen:
+            streams.append((name, output))
+            seen.add(output)
+    if not streams:
+        return "<no output>"
+
+    framing = sum(len(name) + 2 for name, _ in streams) + len(streams) - 1
+    per_stream = max(1, (limit - framing) // len(streams))
+    return "\n".join(f"{name}: {output[-per_stream:]}" for name, output in streams)
 
 
 def parse_gpu(gpu: str | None) -> tuple[str | None, int]:
@@ -107,8 +126,18 @@ class Runtime(ABC):
     is_local: ClassVar[bool] = True
     """Whether this runtime shares the host network — a program inside it reaches a host service
     at localhost (no tunnel) and a service inside it is reachable at localhost. True for
-    subprocess / docker(--network host); remote runtimes (modal/prime) override to False (they
+    subprocess / docker(--network host); remote runtimes (modal/prime/sandoq/vmvm) override to False (they
     need a tunnel each way: `host_endpoint` inward, `expose` outward)."""
+
+    # Whether reaching a host port requires this provisioned runtime instance. Most
+    # remote runtimes use the provider-independent public host tunnel, which can be
+    # shared before an individual sandbox exists. VMVM reaches the host over its vacli
+    # SSH lease, while Sandoq selects its own tunnel backend; both endpoints are opened
+    # after the runtime has started.
+    instance_host_endpoint: ClassVar[bool] = False
+
+    # Whether an otherwise successful rollout must record teardown failure.
+    cleanup_must_succeed: ClassVar[bool] = False
 
     def __init__(self, name: str | None = None) -> None:
         self.name = name or f"vf-{uuid.uuid4().hex[:12]}"
@@ -123,7 +152,7 @@ class Runtime(ABC):
 
     @property
     def type(self) -> str:
-        """The runtime's config discriminator ("subprocess" / "docker" / "prime" / "modal")."""
+        """The runtime's config discriminator (subprocess/docker/prime/modal/sandoq/vmvm)."""
         return self.config.type
 
     @property
@@ -149,6 +178,9 @@ class Runtime(ABC):
         source of truth for teardown: usable from the atexit backstop where async machinery
         is dead, and run off the event loop by `stop` on the normal path. Default no-op."""
 
+    def ensure_usable(self) -> None:
+        """Raise when cancellation left this runtime unsafe for later lifecycle phases."""
+
     # --- execution ---
 
     @abstractmethod
@@ -163,15 +195,11 @@ class Runtime(ABC):
         still retry individual safe transport operations underneath `run`."""
         return await self.run(argv, env)
 
-    async def run_background(
-        self, argv: list[str], env: dict[str, str], log: str
-    ) -> None:
+    async def run_background(self, argv: list[str], env: dict[str, str], log: str) -> None:
         """Start `argv` as a background process in the runtime (combined output to
         `log`, a path in the workspace) and return immediately. It runs until `stop()`
         tears the runtime down. Used to host a tool server colocated with the harness."""
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support run_background"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support run_background")
 
     async def prepare_uv_script(
         self,
@@ -185,25 +213,52 @@ class Runtime(ABC):
         if digest not in self._uv_interpreters:
             async with self._uv_script_locks.setdefault(digest, asyncio.Lock()):
                 if digest not in self._uv_interpreters:
+                    directory = str(PurePosixPath(path).parent)
+                    mkdir = await self.run(["mkdir", "-p", directory], {})
+                    if mkdir.exit_code != 0:
+                        raise RuntimeError(
+                            "failed to create uv script directory "
+                            f"(exit_code={mkdir.exit_code}): "
+                            f"{_program_failure_detail(mkdir)}"
+                        )
                     tmp = f"{path}.{uuid.uuid4().hex}.tmp"
                     await self.write(tmp, data)
-                    await self.run(
+                    publish = await self.run(
                         ["sh", "-c", f"mv -f {shlex.quote(tmp)} {shlex.quote(path)}"],
                         {},
                     )
+                    if publish.exit_code != 0:
+                        raise RuntimeError(
+                            "failed to publish uv script "
+                            f"(exit_code={publish.exit_code}): "
+                            f"{_program_failure_detail(publish)}"
+                        )
                     command = (
                         f"{_ENSURE_UV}; uv sync --script {shlex.quote(path)} -q "
                         f"&& uv python find --script {shlex.quote(path)}"
                     )
-                    result = await self.run(["sh", "-c", command], env or {})
-                    if result.exit_code != 0:
-                        raise RuntimeError(
-                            "failed to prepare uv script: "
-                            f"{result.stderr.strip()[-2000:]}"
-                        )
-                    self._uv_interpreters[digest] = result.stdout.strip().splitlines()[
-                        -1
-                    ]
+                    interpreter = None
+                    async for attempt in retrying(
+                        retries=_UV_PREPARE_RETRIES,
+                        label="uv script preparation",
+                    ):
+                        with attempt:
+                            result = await self.run(["sh", "-c", command], env or {})
+                            if result.exit_code != 0:
+                                raise RuntimeError(
+                                    "failed to prepare uv script "
+                                    f"(exit_code={result.exit_code}): "
+                                    f"{_program_failure_detail(result)}"
+                                )
+                            output_lines = result.stdout.strip().splitlines()
+                            if not output_lines:
+                                raise RuntimeError(
+                                    "failed to prepare uv script (exit_code=0): "
+                                    "uv python find returned no interpreter path"
+                                )
+                            interpreter = output_lines[-1]
+                    assert interpreter is not None
+                    self._uv_interpreters[digest] = interpreter
         interpreter = self._uv_interpreters[digest]
         venv = str(PurePosixPath(interpreter).parent.parent)
         command = (
@@ -277,17 +332,32 @@ class Runtime(ABC):
         (which reaches a host port from inside a runtime)."""
         return None
 
+    @contextlib.asynccontextmanager
+    async def host_endpoint(self, port: int):
+        """Yield a URL this runtime can use to reach a service on the host."""
+        async with host_endpoint(port, self.is_local) as url:
+            yield url
+
+    @contextlib.asynccontextmanager
+    async def interception_endpoint(self, port: int, secret: str):
+        """Yield the model interception URL exposed to this runtime.
+
+        Most runtimes expose the interception server directly. A runtime may
+        override this boundary when its remote transport needs a protocol
+        adapter while retaining the rollout-scoped bearer secret.
+        """
+        del secret
+        async with self.host_endpoint(port) as url:
+            yield url
+
 
 TunnelT = TypeVar("TunnelT")
 
 
-async def open_tunnel(
-    start: Callable[[], Awaitable[TunnelT]], what: str, *, retries: int = 3
-) -> TunnelT:
-    """Open the host interception-server tunnel via `start`, retrying transient failures and raise
-    `TunnelError` if it still fails. Tunnel creation is network-bound and globally rate-capped
-    (`prime_tunnel` — 512/min shared across runtimes), so a transient failure is common and worth a
-    few retries before failing the rollout. `what` names the tunnel in the error."""
+async def open_tunnel(start: Callable[[], Awaitable[TunnelT]], what: str, *, retries: int = 3) -> TunnelT:
+    """Open a tunnel via `start`, retrying transient failures and raising `TunnelError` if it
+    still fails. Tunnel creation is network-bound and may be provider-rate-capped, so a transient
+    failure is common and worth a few retries. `what` names the tunnel in the error."""
     from verifiers.v1.errors import TunnelError
 
     try:
@@ -316,9 +386,7 @@ async def host_endpoint(port: int, is_local: bool, labels: list[str] | None = No
 
     async def _start() -> tuple[Tunnel, str]:
         tunnel = Tunnel(local_port=port, labels=labels or None)
-        async with (
-            TUNNEL_LIMITER
-        ):  # shared prime_tunnel rate (512/min, runtime-independent)
+        async with TUNNEL_LIMITER:  # shared prime_tunnel rate (512/min, runtime-independent)
             return tunnel, str(await tunnel.start()).rstrip("/")
 
     tunnel, url = await open_tunnel(_start, f"host tunnel (port {port})")
@@ -352,9 +420,7 @@ framework driving a user sim) — see `reachable_url`."""
 
 
 @contextlib.asynccontextmanager
-async def reachable_url(
-    service, port: int, *, consumer=None, consumer_is_local: bool = True
-):
+async def reachable_url(service, port: int, *, consumer=None, consumer_is_local: bool = True):
     """Yield a URL for the service at (`service`, `port`) reachable from its consumer — the single
     place tool / user / interception reachability is decided, over the two primitives `expose`
     (publish *out* of a runtime) and `host_endpoint` (reach *into* the host from a runtime).
@@ -372,10 +438,9 @@ async def reachable_url(
     is_local = consumer.is_local if consumer is not None else consumer_is_local
     if service is consumer:  # colocated in the consumer's runtime (or host -> host)
         yield f"http://127.0.0.1:{port}"
-    elif (
-        service is not HOST and not service.is_local
-    ):  # in a sandbox → it publishes its own port
+    elif service is not HOST and not service.is_local:  # in a sandbox → it publishes its own port
         yield await service.expose(port)
     else:  # on the host network → reach it from wherever the consumer runs
-        async with host_endpoint(port, is_local) as url:
+        endpoint = consumer.host_endpoint(port) if consumer is not None else host_endpoint(port, is_local)
+        async with endpoint as url:
             yield url

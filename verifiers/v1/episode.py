@@ -45,6 +45,7 @@ class Episode:
         self,
         semaphore: asyncio.Semaphore | None = None,
         on_complete: Callable[[Trace], Awaitable[None]] | None = None,
+        retain_traces: bool = True,
     ) -> list[Trace]:
         """Run all rollouts (each under `semaphore`), then group-score across their
         traces. Without `@group_reward`s a rollout's reward is final the moment its own
@@ -54,21 +55,33 @@ class Episode:
         shared tool servers / interception pool (injected by `Environment.episode`).
         `on_complete` (the runner's persist hook) is called with each trace the instant
         it's finalized (DONE) — per rollout without group rewards, or once per trace after
-        group scoring with them."""
+        group scoring with them. With ``retain_traces=False``, a finalized trace is released
+        immediately after that hook completes; group-scored traces stay resident only until
+        their group has been scored and persisted."""
         group_scored = bool(discover_decorated(self.taskset, "group_reward"))
 
-        async def run_one(rollout: Rollout) -> Trace:
+        async def run_one(rollout: Rollout) -> Trace | None:
             async with semaphore or nullcontext():
                 trace = await run_with_retry(rollout, self.retry)
             if not group_scored:  # reward already final → don't wait for the group
                 rollout.phase = Phase.DONE
                 if on_complete is not None:
                     await on_complete(trace)
+                if not retain_traces:
+                    rollout.trace = None
             # hand freed per-turn request bodies (base64 images) back to the OS
             await trim_memory_periodically()
-            return trace
+            return trace if group_scored or retain_traces else None
 
-        traces = await asyncio.gather(*(run_one(r) for r in self.rollouts))
+        running = [asyncio.create_task(run_one(rollout)) for rollout in self.rollouts]
+        try:
+            completed = await asyncio.gather(*running)
+        except BaseException:
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            raise
+        traces = [trace for trace in completed if trace is not None]
         if group_scored:
             await self.taskset.score_group(traces)  # cross-rollout @group_rewards
             for rollout in self.rollouts:
@@ -76,4 +89,8 @@ class Episode:
             for trace in traces:
                 if on_complete is not None:
                     await on_complete(trace)
+            if not retain_traces:
+                for rollout in self.rollouts:
+                    rollout.trace = None
+                return []
         return traces
