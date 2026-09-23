@@ -3,7 +3,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from verifiers.v1.env import EnvConfig, Environment
 from verifiers.v1.harness import Harness, HarnessConfig
 from verifiers.v1.interception import InterceptionPool
@@ -20,6 +19,12 @@ class FakeRemoteRuntime:
     async def host_endpoint(self, port: int):
         self.host_endpoint_calls.append(port)
         yield f"https://remote.example/{port}"
+
+    @asynccontextmanager
+    async def interception_endpoint(self, port: int, secret: str):
+        del secret
+        async with self.host_endpoint(port) as endpoint:
+            yield endpoint
 
 
 class EmptyTaskset(Taskset):
@@ -59,9 +64,7 @@ def host_sandoq_config() -> SandoqConfig:
     )
 
 
-async def test_host_side_harness_uses_local_interception_without_runtime_tunnel() -> (
-    None
-):
+async def test_host_side_harness_uses_local_interception_without_runtime_tunnel() -> None:
     runtime = FakeRemoteRuntime()
     pool = InterceptionPool(
         host_sandoq_config(),
@@ -127,9 +130,7 @@ async def test_nonpooled_host_harness_uses_local_interception() -> None:
         runtime_config=host_sandoq_config(),
     )
 
-    async with rollout._serve_interception(
-        None, runtime, SimpleNamespace(closed=False)
-    ) as (
+    async with rollout._serve_interception(None, runtime, SimpleNamespace(closed=False)) as (
         endpoint,
         _secret,
         _state_port,
@@ -142,9 +143,7 @@ async def test_nonpooled_host_harness_uses_local_interception() -> None:
 
 
 @pytest.mark.parametrize("host_tunnel", ["sandoq", "modal", "prime"])
-def test_environment_rejects_host_harness_with_remote_sandoq_tunnel(
-    monkeypatch, host_tunnel: str
-) -> None:
+def test_environment_rejects_host_harness_with_remote_sandoq_tunnel(monkeypatch, host_tunnel: str) -> None:
     taskset = EmptyTaskset(TasksetConfig(id="fake-taskset"))
     harness = HostHarness(
         HarnessConfig(
@@ -208,9 +207,7 @@ def test_environment_rejects_runtime_harness_without_sandoq_tunnel(
 
 
 @pytest.mark.parametrize("taskset_type", [ToolTaskset, UserTaskset])
-def test_host_harness_rejects_unplumbed_tool_or_user_consumers(
-    monkeypatch, taskset_type
-) -> None:
+def test_host_harness_rejects_unplumbed_tool_or_user_consumers(monkeypatch, taskset_type) -> None:
     taskset = taskset_type(TasksetConfig(id="fake-taskset"))
     harness = HostHarness(
         HarnessConfig(

@@ -86,9 +86,7 @@ class FailingClient:
         raise RuntimeError("unexpected auxiliary parser failure")
 
 
-def _server_and_session(
-    client, *, prompt: str | None = "test"
-) -> tuple[InterceptionServer, RolloutSession]:
+def _server_and_session(client, *, prompt: str | None = "test") -> tuple[InterceptionServer, RolloutSession]:
     trace = Trace(task=Task(idx=0, prompt=prompt))
     session = RolloutSession(
         ctx=RolloutContext(
@@ -116,9 +114,7 @@ async def test_invalid_dialect_request_is_stored_as_non_retryable_harness_error(
 
     assert response.status == 400
     assert isinstance(session.error, HarnessError)
-    assert _response_error(response).startswith(
-        "invalid harness model request: ValueError:"
-    )
+    assert _response_error(response).startswith("invalid harness model request: ValueError:")
     session.trace.capture_error(session.error)
     retry = RolloutRetryConfig(
         max_retries=2,
@@ -135,9 +131,7 @@ async def test_malformed_json_is_stored_as_non_retryable_harness_error():
 
     assert response.status == 400
     assert isinstance(session.error, HarnessError)
-    assert _response_error(response).startswith(
-        "invalid harness model request: JSONDecodeError:"
-    )
+    assert _response_error(response).startswith("invalid harness model request: JSONDecodeError:")
 
 
 @pytest.mark.asyncio
@@ -148,9 +142,7 @@ async def test_request_transport_failure_is_stored_as_interception_error():
 
     assert response.status == 502
     assert isinstance(session.error, InterceptionError)
-    assert _response_error(response).startswith(
-        "reading harness request failed: RuntimeError:"
-    )
+    assert _response_error(response).startswith("reading harness request failed: RuntimeError:")
 
 
 @pytest.mark.asyncio
@@ -214,9 +206,7 @@ async def test_prepare_turn_failure_is_stored_as_interception_error(monkeypatch)
 
     assert response.status == 502
     assert isinstance(session.error, InterceptionError)
-    assert _response_error(response).startswith(
-        "preparing model turn failed: RuntimeError:"
-    )
+    assert _response_error(response).startswith("preparing model turn failed: RuntimeError:")
 
 
 @pytest.mark.asyncio
@@ -252,9 +242,7 @@ async def test_commit_failure_is_stored_as_interception_error():
 
     assert response.status == 502
     assert isinstance(session.error, InterceptionError)
-    assert _response_error(response).startswith(
-        "committing model turn failed: RuntimeError:"
-    )
+    assert _response_error(response).startswith("committing model turn failed: RuntimeError:")
 
 
 @pytest.mark.asyncio
@@ -407,9 +395,7 @@ async def test_closed_session_ignores_late_stream_completion(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stream_finalize_failure_is_stored_as_provider_error(monkeypatch):
-    monkeypatch.setattr(
-        "verifiers.v1.interception.server.web.StreamResponse", StreamResponse
-    )
+    monkeypatch.setattr("verifiers.v1.interception.server.web.StreamResponse", StreamResponse)
     server, session = _server_and_session(FinalizeFailingClient())
 
     await server._stream(
@@ -426,9 +412,7 @@ async def test_stream_finalize_failure_is_stored_as_provider_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stream_iterator_failure_is_stored_as_provider_error(monkeypatch):
-    monkeypatch.setattr(
-        "verifiers.v1.interception.server.web.StreamResponse", StreamResponse
-    )
+    monkeypatch.setattr("verifiers.v1.interception.server.web.StreamResponse", StreamResponse)
     server, session = _server_and_session(IteratorFailingClient())
 
     await server._stream(
@@ -445,9 +429,7 @@ async def test_stream_iterator_failure_is_stored_as_provider_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stream_close_failure_is_stored_as_provider_error(monkeypatch):
-    monkeypatch.setattr(
-        "verifiers.v1.interception.server.web.StreamResponse", StreamResponse
-    )
+    monkeypatch.setattr("verifiers.v1.interception.server.web.StreamResponse", StreamResponse)
     server, session = _server_and_session(CloseFailingClient())
 
     await server._stream(
@@ -464,9 +446,7 @@ async def test_stream_close_failure_is_stored_as_provider_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stream_commit_failure_is_stored_as_interception_error(monkeypatch):
-    monkeypatch.setattr(
-        "verifiers.v1.interception.server.web.StreamResponse", StreamResponse
-    )
+    monkeypatch.setattr("verifiers.v1.interception.server.web.StreamResponse", StreamResponse)
     server, session = _server_and_session(FinalizeFailingClient())
 
     def fail_commit(*args, **kwargs):
@@ -498,9 +478,7 @@ async def test_stream_commit_failure_is_stored_as_interception_error(monkeypatch
     )
 
     assert isinstance(session.error, InterceptionError)
-    assert str(session.error).startswith(
-        "committing streamed model turn failed: RuntimeError:"
-    )
+    assert str(session.error).startswith("committing streamed model turn failed: RuntimeError:")
 
 
 @pytest.mark.asyncio
@@ -528,15 +506,11 @@ async def test_malformed_aux_json_is_stored_as_harness_error():
 async def test_aux_transport_failure_is_stored_as_interception_error():
     server, session = _server_and_session(UnusedClient())
 
-    response = await server.handle_aux(
-        Request(fail_read=True), Dialect(), "/v1/count_tokens"
-    )
+    response = await server.handle_aux(Request(fail_read=True), Dialect(), "/v1/count_tokens")
 
     assert response.status == 502
     assert isinstance(session.error, InterceptionError)
-    assert _response_error(response).startswith(
-        "reading harness auxiliary request failed: RuntimeError:"
-    )
+    assert _response_error(response).startswith("reading harness auxiliary request failed: RuntimeError:")
     session.trace.capture_error(session.error)
     retry = RolloutRetryConfig(
         max_retries=2,
@@ -554,15 +528,11 @@ async def test_aux_transport_failure_is_stored_as_interception_error():
 async def test_oversized_aux_request_is_stored_as_harness_error_with_413():
     server, session = _server_and_session(UnusedClient())
 
-    response = await server.handle_aux(
-        OversizedRequest(), Dialect(), "/v1/count_tokens"
-    )
+    response = await server.handle_aux(OversizedRequest(), Dialect(), "/v1/count_tokens")
 
     assert response.status == 413
     assert isinstance(session.error, HarnessError)
-    assert _response_error(response).startswith(
-        "harness auxiliary request body too large:"
-    )
+    assert _response_error(response).startswith("harness auxiliary request body too large:")
 
 
 @pytest.mark.asyncio
@@ -601,9 +571,7 @@ async def test_handler_fallback_stores_interception_error(monkeypatch):
 
     assert response.status == 502
     assert isinstance(session.error, InterceptionError)
-    assert _response_error(response).startswith(
-        "interception request failed: RuntimeError:"
-    )
+    assert _response_error(response).startswith("interception request failed: RuntimeError:")
 
 
 @pytest.mark.asyncio
@@ -683,9 +651,7 @@ async def test_closed_session_ignores_late_aux_failure():
                 raise ProviderError("late auxiliary failure")
 
     server, session = _server_and_session(CancellationResistantClient())
-    request = asyncio.create_task(
-        server._aux_handler_for(Dialect(), "/v1/count_tokens")(Request())
-    )
+    request = asyncio.create_task(server._aux_handler_for(Dialect(), "/v1/count_tokens")(Request()))
     await asyncio.wait_for(started.wait(), timeout=1)
 
     await server.unregister("secret")
@@ -811,6 +777,12 @@ async def test_pool_excludes_entry_while_failed_unregister_is_draining(monkeypat
         @asynccontextmanager
         async def host_endpoint(self, port: int):
             yield f"http://127.0.0.1:{port}"
+
+        @asynccontextmanager
+        async def interception_endpoint(self, port: int, secret: str):
+            del secret
+            async with self.host_endpoint(port) as endpoint:
+                yield endpoint
 
     runtime = Runtime()
 

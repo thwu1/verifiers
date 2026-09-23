@@ -93,6 +93,8 @@ class SandoqConfig(BaseConfig):
     """Loopback endpoint exposed by the Sandoq Firecracker environment."""
     tunnel_pool_size: int = Field(8, ge=1, le=64)
     tunnel_ready_timeout: float = Field(30.0, gt=0, le=120)
+    buffered_chat_completions: bool = False
+    """Buffer guest SSE calls into exact non-streaming provider responses."""
     expected_environment: str | None = None
     """Exact registry environment required by policy-sensitive callers."""
     ecr_token_file: Path | None = None
@@ -121,6 +123,8 @@ class SandoqConfig(BaseConfig):
             raise ValueError("Sandoq OCI no-network execution requires a host-side harness and no host tunnel")
         if self.host_tunnel == "none" and self.mode != "oci-runner":
             raise ValueError("Sandoq host-side execution is supported only by OCI runner mode")
+        if self.buffered_chat_completions and (self.mode != "oci-runner" or self.host_tunnel != "sandoq"):
+            raise ValueError("buffered_chat_completions requires the native Sandoq host tunnel")
         return self
 
 
@@ -554,6 +558,27 @@ class SandoqRuntime(Runtime):
                 )
             if cancelled is not None and original_error is None:
                 raise cancelled
+
+    @contextlib.asynccontextmanager
+    async def interception_endpoint(self, port: int, secret: str):
+        if not self.config.buffered_chat_completions:
+            async with self.host_endpoint(port) as url:
+                yield url
+            return
+        try:
+            from sandoq_provider.buffered_chat import BufferedChatCompletionsProxy
+        except (ImportError, ModuleNotFoundError) as error:
+            raise SandboxError(
+                "buffered Sandoq interception requires sandoq_provider.buffered_chat on PYTHONPATH"
+            ) from error
+
+        proxy = BufferedChatCompletionsProxy(f"http://127.0.0.1:{port}", secret)
+        await proxy.start()
+        try:
+            async with self.host_endpoint(proxy.port) as url:
+                yield url
+        finally:
+            await proxy.close()
 
     def cleanup(self) -> None:
         if not self._active:

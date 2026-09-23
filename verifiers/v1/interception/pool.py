@@ -56,9 +56,7 @@ class InterceptionPool:
         self.runtime_type = runtime_config.type
         self.is_local = consumer_runs_on_host or runtime_is_local(runtime_config)
         self.instance_host_endpoint = (
-            False
-            if consumer_runs_on_host
-            else runtime_has_instance_host_endpoint(runtime_config)
+            False if consumer_runs_on_host else runtime_has_instance_host_endpoint(runtime_config)
         )
         self.multiplex = max(1, multiplex)
         self._servers: list[PooledServer] = []
@@ -153,7 +151,7 @@ class InterceptionPool:
                         if not isinstance(primary_error, asyncio.CancelledError):
                             raise
             else:
-                async with runtime.host_endpoint(entry.server.port) as base_url:
+                async with runtime.interception_endpoint(entry.server.port, secret) as base_url:
                     try:
                         yield f"{base_url}/v1", secret, entry.server.port, base_url
                     except BaseException as error:

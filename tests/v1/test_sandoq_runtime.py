@@ -684,6 +684,57 @@ async def test_sandoq_runtime_uses_native_reverse_tunnel(monkeypatch) -> None:
     ]
 
 
+async def test_sandoq_runtime_buffers_interception_before_native_tunnel(monkeypatch) -> None:
+    events: list[object] = []
+
+    class FakeBufferedProxy:
+        def __init__(self, endpoint: str, secret: str) -> None:
+            events.append(("proxy-init", endpoint, secret))
+            self.port = 5678
+
+        async def start(self) -> None:
+            events.append("proxy-start")
+
+        async def close(self) -> None:
+            events.append("proxy-close")
+
+    buffered_module = ModuleType("sandoq_provider.buffered_chat")
+    buffered_module.BufferedChatCompletionsProxy = FakeBufferedProxy
+    monkeypatch.setitem(sys.modules, "sandoq_provider.buffered_chat", buffered_module)
+    runtime = SandoqRuntime(
+        SandoqConfig(
+            host_tunnel="sandoq",
+            buffered_chat_completions=True,
+        )
+    )
+
+    @asynccontextmanager
+    async def fake_host_endpoint(port: int):
+        events.append(("tunnel", port))
+        yield "http://127.0.0.1:8485"
+
+    monkeypatch.setattr(runtime, "host_endpoint", fake_host_endpoint)
+
+    async with runtime.interception_endpoint(4321, "rollout-secret") as url:
+        assert url == "http://127.0.0.1:8485"
+        events.append("yield")
+
+    assert events == [
+        ("proxy-init", "http://127.0.0.1:4321", "rollout-secret"),
+        "proxy-start",
+        ("tunnel", 5678),
+        "yield",
+        "proxy-close",
+    ]
+
+
+@pytest.mark.parametrize("updates", [{"host_tunnel": "modal"}, {"mode": "environment"}])
+def test_sandoq_buffered_interception_requires_native_tunnel(updates) -> None:
+    config = {"buffered_chat_completions": True, "host_tunnel": "sandoq", **updates}
+    with pytest.raises(ValueError, match="buffered_chat_completions"):
+        SandoqConfig(**config)
+
+
 async def test_sandoq_runtime_attributes_native_tunnel_start_failure(
     monkeypatch,
 ) -> None:
