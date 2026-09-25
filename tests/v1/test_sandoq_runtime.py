@@ -512,7 +512,7 @@ async def test_sandoq_runtime_preserves_provider_wrapped_provisioning_cancellati
     await waiting.wait()
 
     starting.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as caught:
         await starting
 
     assert create_calls == 1
@@ -520,6 +520,9 @@ async def test_sandoq_runtime_preserves_provider_wrapped_provisioning_cancellati
     assert runtime.descriptor is None
     assert runtime._active is False
     assert client.closed is True
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "private cleanup failure" not in rendered
+    assert "private-assignment" not in rendered
 
 
 async def test_sandoq_runtime_reports_aggregate_after_all_provisioning_attempts_fail(

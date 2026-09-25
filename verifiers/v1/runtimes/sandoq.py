@@ -297,7 +297,7 @@ class SandoqRuntime(Runtime):
                 cancelled, cleanup_error, retry_safe = await self._cleanup_failed_provisioning(client, error)
                 if cancelled is not None:
                     await self._close_inactive_client(client)
-                    raise cancelled
+                    raise cancelled from None
                 if retry_safe and attempt < total_attempts:
                     logger.warning(
                         "sandoq: retrying sandbox provisioning after verified cleanup (retry %d/%d)",
