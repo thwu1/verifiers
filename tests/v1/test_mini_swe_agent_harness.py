@@ -1,6 +1,9 @@
 import ast
+import contextvars
 import importlib.metadata
 import os
+import re
+import secrets
 import subprocess
 from types import SimpleNamespace
 
@@ -24,11 +27,28 @@ def _streaming_query_shim(original_query, stream_chunk_builder):
         node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_streaming_litellm_query"
     )
     namespace = {
+        "_LOGICAL_REQUEST_HEADER": "X-VF-Logical-Request-ID",
+        "_LOGICAL_REQUEST_ID": contextvars.ContextVar("test_logical_request_id", default="a" * 32),
         "_ORIGINAL_LITELLM_QUERY": original_query,
         "litellm": SimpleNamespace(stream_chunk_builder=stream_chunk_builder),
     }
     exec(compile(ast.Module(body=[query], type_ignores=[]), "program.py", "exec"), namespace)
     return namespace["_streaming_litellm_query"]
+
+
+def _logical_query_shim(original_query):
+    tree = ast.parse(PROGRAM_SOURCE)
+    query = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_logical_litellm_query"
+    )
+    request_id = contextvars.ContextVar("test_logical_request_id", default=None)
+    namespace = {
+        "_LOGICAL_REQUEST_ID": request_id,
+        "_ORIGINAL_LITELLM_PUBLIC_QUERY": original_query,
+        "secrets": secrets,
+    }
+    exec(compile(ast.Module(body=[query], type_ignores=[]), "program.py", "exec"), namespace)
+    return namespace["_logical_litellm_query"], request_id
 
 
 def test_mini_swe_agent_rebuilds_streaming_response() -> None:
@@ -49,9 +69,102 @@ def test_mini_swe_agent_rebuilds_streaming_response() -> None:
 
     assert query(model, messages, temperature=0) is expected_response
     assert calls == [
-        (model, messages, {"temperature": 0, "stream": True}),
+        (
+            model,
+            messages,
+            {
+                "temperature": 0,
+                "stream": True,
+                "extra_headers": {"X-VF-Logical-Request-ID": "a" * 32},
+            },
+        ),
         (["first", "second"], messages),
     ]
+
+
+def test_mini_swe_agent_logical_request_id_is_stable_within_query_and_rotates() -> None:
+    seen: list[str | None] = []
+
+    def original_query(_model, _messages, **_kwargs):
+        seen.extend([request_id.get(), request_id.get()])
+        return "response"
+
+    query, request_id = _logical_query_shim(original_query)
+    assert query(object(), []) == "response"
+    assert query(object(), []) == "response"
+
+    assert len(seen) == 4
+    assert seen[0] == seen[1]
+    assert seen[2] == seen[3]
+    assert seen[0] != seen[2]
+    assert all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) for value in seen)
+    assert request_id.get() is None
+
+
+def test_mini_swe_agent_streaming_query_replaces_private_identity_header() -> None:
+    seen: list[dict] = []
+
+    def original_query(_model, _messages, **kwargs):
+        seen.append(kwargs)
+        return iter(["chunk"])
+
+    query = _streaming_query_shim(original_query, lambda _chunks, *, messages: messages)
+    assert (
+        query(
+            object(),
+            [],
+            extra_headers={"x-vf-logical-request-id": "untrusted", "X-Keep": "yes"},
+        )
+        == []
+    )
+    assert seen == [
+        {
+            "stream": True,
+            "extra_headers": {
+                "X-Keep": "yes",
+                "X-VF-Logical-Request-ID": "a" * 32,
+            },
+        }
+    ]
+
+
+def test_mini_swe_agent_model_retry_reuses_logical_request_id() -> None:
+    tree = ast.parse(PROGRAM_SOURCE)
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"_logical_litellm_query", "_streaming_litellm_query"}
+    ]
+    seen: list[str] = []
+    namespace = {
+        "_LOGICAL_REQUEST_HEADER": "X-VF-Logical-Request-ID",
+        "_LOGICAL_REQUEST_ID": contextvars.ContextVar("test_retry_request_id", default=None),
+        "litellm": SimpleNamespace(stream_chunk_builder=lambda chunks, *, messages: list(chunks)),
+        "secrets": secrets,
+    }
+
+    def transport(_model, _messages, **kwargs):
+        seen.append(kwargs["extra_headers"]["X-VF-Logical-Request-ID"])
+        if len(seen) == 1:
+            raise ConnectionError("retry")
+        return iter(["response"])
+
+    def public_query(model, messages, **kwargs):
+        for _ in range(2):
+            try:
+                return namespace["_streaming_litellm_query"](model, messages, **kwargs)
+            except ConnectionError:
+                continue
+        raise AssertionError("retry did not return")
+
+    namespace["_ORIGINAL_LITELLM_QUERY"] = transport
+    namespace["_ORIGINAL_LITELLM_PUBLIC_QUERY"] = public_query
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "program.py", "exec"), namespace)
+
+    assert namespace["_logical_litellm_query"](object(), []) == ["response"]
+    assert len(seen) == 2
+    assert seen[0] == seen[1]
+    assert re.fullmatch(r"[0-9a-f]{32}", seen[0])
 
 
 def test_mini_swe_agent_rejects_empty_stream() -> None:

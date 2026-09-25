@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import shlex
@@ -578,7 +579,16 @@ class SandoqRuntime(Runtime):
             async with self.host_endpoint(proxy.port) as url:
                 yield url
         finally:
-            await proxy.close()
+            try:
+                await proxy.close()
+            finally:
+                snapshot = proxy.stats.snapshot()
+                errors = snapshot.pop("errors", [])
+                snapshot["error_count"] = len(errors)
+                logger.info(
+                    "sandoq: buffered model proxy summary %s",
+                    json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
+                )
 
     def cleanup(self) -> None:
         if not self._active:

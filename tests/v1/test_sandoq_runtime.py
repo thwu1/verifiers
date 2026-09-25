@@ -684,13 +684,21 @@ async def test_sandoq_runtime_uses_native_reverse_tunnel(monkeypatch) -> None:
     ]
 
 
-async def test_sandoq_runtime_buffers_interception_before_native_tunnel(monkeypatch) -> None:
+async def test_sandoq_runtime_buffers_interception_before_native_tunnel(monkeypatch, caplog) -> None:
     events: list[object] = []
+    caplog.set_level("INFO", logger="verifiers.v1.runtimes.sandoq")
 
     class FakeBufferedProxy:
         def __init__(self, endpoint: str, secret: str) -> None:
             events.append(("proxy-init", endpoint, secret))
             self.port = 5678
+            self.stats = SimpleNamespace(
+                snapshot=lambda: {
+                    "requests": 2,
+                    "upstream_attempts": 1,
+                    "errors": ["private failure detail"],
+                }
+            )
 
         async def start(self) -> None:
             events.append("proxy-start")
@@ -726,6 +734,9 @@ async def test_sandoq_runtime_buffers_interception_before_native_tunnel(monkeypa
         "yield",
         "proxy-close",
     ]
+    assert 'upstream_attempts":1' in caplog.text
+    assert 'error_count":1' in caplog.text
+    assert "private failure detail" not in caplog.text
 
 
 @pytest.mark.parametrize("updates", [{"host_tunnel": "modal"}, {"mode": "environment"}])

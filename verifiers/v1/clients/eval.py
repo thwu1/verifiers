@@ -47,6 +47,9 @@ _BLOCKED_REQUEST_HEADERS = frozenset(
         "te",
         "trailer",
         "upgrade",
+        # Private harness-to-interceptor identity used to coalesce retries. It is not a
+        # provider feature and must never leave the local interception boundary.
+        "x-vf-logical-request-id",
         # The eval owns the model and sampling settings, so it changes those JSON fields before
         # sending upstream. Hashes and signatures calculated from the intercepted body are stale.
         "content-digest",

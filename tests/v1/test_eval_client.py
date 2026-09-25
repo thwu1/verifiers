@@ -154,6 +154,27 @@ async def test_session_id_sets_generic_and_litellm_affinity_headers():
 
 
 @pytest.mark.asyncio
+async def test_private_logical_request_identity_is_not_forwarded_to_provider():
+    client = EvalClient("http://provider/v1", "key")
+    try:
+        headers = client._headers(
+            ChatDialect(),
+            httpx.Headers(
+                {
+                    "X-VF-Logical-Request-ID": "a" * 32,
+                    "X-Provider-Feature": "kept",
+                }
+            ),
+            "trajectory-123",
+        )
+    finally:
+        await client.close()
+
+    assert "X-VF-Logical-Request-ID" not in headers
+    assert headers["X-Provider-Feature"] == "kept"
+
+
+@pytest.mark.asyncio
 async def test_outbound_body_denylist_is_final_and_top_level(monkeypatch):
     sent: list[dict] = []
     client = EvalClient(

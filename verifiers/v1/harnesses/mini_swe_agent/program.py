@@ -3,8 +3,10 @@
 # dependencies = ["mini-swe-agent=={version}"]
 # ///
 
+import contextvars
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,18 @@ from minisweagent.models.litellm_model import LitellmModel
 from minisweagent.run.mini import app
 
 _ORIGINAL_LITELLM_QUERY = LitellmModel._query
+_ORIGINAL_LITELLM_PUBLIC_QUERY = LitellmModel.query
+_LOGICAL_REQUEST_ID = contextvars.ContextVar("vf_logical_request_id", default=None)
+_LOGICAL_REQUEST_HEADER = "X-VF-Logical-Request-ID"
+
+
+def _logical_litellm_query(self, messages, **kwargs):
+    """Use one private request identity for every retry of a logical turn."""
+    token = _LOGICAL_REQUEST_ID.set(secrets.token_hex(16))
+    try:
+        return _ORIGINAL_LITELLM_PUBLIC_QUERY(self, messages, **kwargs)
+    finally:
+        _LOGICAL_REQUEST_ID.reset(token)
 
 
 def _streaming_litellm_query(self, messages, **kwargs):
@@ -31,7 +45,16 @@ def _streaming_litellm_query(self, messages, **kwargs):
     generations.  MiniSWE still receives one ordinary ModelResponse, including
     reconstructed reasoning content, tool calls, finish reason, and usage.
     """
-    stream_kwargs = {**kwargs, "stream": True}
+    logical_request_id = _LOGICAL_REQUEST_ID.get()
+    if logical_request_id is None:
+        raise RuntimeError("MiniSWE logical request identity is missing")
+    extra_headers = {
+        key: value
+        for key, value in (kwargs.get("extra_headers") or {}).items()
+        if key.casefold() != _LOGICAL_REQUEST_HEADER.casefold()
+    }
+    extra_headers[_LOGICAL_REQUEST_HEADER] = logical_request_id
+    stream_kwargs = {**kwargs, "stream": True, "extra_headers": extra_headers}
     chunks = list(_ORIGINAL_LITELLM_QUERY(self, messages, **stream_kwargs))
     response = litellm.stream_chunk_builder(chunks, messages=messages)
     if response is None:
@@ -118,5 +141,6 @@ class _BashSubprocess:
 InteractiveAgent.query = DefaultAgent.query
 local_environment.subprocess = _BashSubprocess
 LitellmModel._query = _streaming_litellm_query
+LitellmModel.query = _logical_litellm_query
 sys.argv = _merged_config_argv(sys.argv)
 app()
