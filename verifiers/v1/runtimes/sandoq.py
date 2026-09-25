@@ -584,7 +584,15 @@ class SandoqRuntime(Runtime):
             finally:
                 snapshot = proxy.stats.snapshot()
                 errors = snapshot.pop("errors", [])
+                paths = snapshot.pop("paths", {})
                 snapshot["error_count"] = len(errors)
+                snapshot["path_counts"] = {
+                    path: int(paths.get(path, 0))
+                    for path in ("/muse-code/models", "/v1/chat/completions", "/v1/responses")
+                }
+                snapshot["unknown_path_requests"] = sum(
+                    int(count) for path, count in paths.items() if path not in snapshot["path_counts"]
+                )
                 logger.info(
                     "sandoq: buffered model proxy summary %s",
                     json.dumps(snapshot, sort_keys=True, separators=(",", ":")),

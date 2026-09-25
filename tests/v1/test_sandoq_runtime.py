@@ -697,6 +697,7 @@ async def test_sandoq_runtime_buffers_interception_before_native_tunnel(monkeypa
                 snapshot=lambda: {
                     "requests": 2,
                     "upstream_attempts": 1,
+                    "paths": {"/v1/chat/completions": 2, "/private/task-derived-path": 1},
                     "errors": ["private failure detail"],
                 }
             )
@@ -738,7 +739,9 @@ async def test_sandoq_runtime_buffers_interception_before_native_tunnel(monkeypa
     log = "\n".join(logs)
     assert 'upstream_attempts":1' in log
     assert 'error_count":1' in log
+    assert 'unknown_path_requests":1' in log
     assert "private failure detail" not in log
+    assert "private/task-derived-path" not in log
 
 
 @pytest.mark.parametrize("updates", [{"host_tunnel": "modal"}, {"mode": "environment"}])
