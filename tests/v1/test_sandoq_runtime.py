@@ -3,6 +3,7 @@ import os
 import stat
 import sys
 import threading
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -308,6 +309,260 @@ async def test_sandoq_runtime_lifecycle(monkeypatch) -> None:
     await runtime.stop()
     assert client.deleted == ["assignment-123"]
     assert client.closed is True
+
+
+async def test_sandoq_runtime_retries_after_attached_verified_cleanup(monkeypatch) -> None:
+    client = FakeSandoqClient()
+    created: list[str] = []
+    logs: list[str] = []
+
+    async def create(request):
+        client.request = request
+        sandbox_id = f"private-assignment-{len(created) + 1}"
+        created.append(sandbox_id)
+        return SimpleNamespace(id=sandbox_id)
+
+    async def wait_for_creation(sandbox_id: str) -> None:
+        if len(created) == 1:
+            error = RuntimeError("private provider failure")
+            error.cleanup_result = {
+                "status": "poisoned",
+                "assignment_id": sandbox_id,
+                "poisoned": True,
+                "outer_deletion_verified_http_status": 404,
+                "error": "private cleanup detail",
+            }
+            raise error
+
+    client.create = create
+    client.wait_for_creation = wait_for_creation
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    monkeypatch.setattr(sandoq.logger, "warning", lambda message, *args: logs.append(message % args))
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal"))
+
+    await runtime.start()
+
+    assert created == ["private-assignment-1", "private-assignment-2"]
+    assert client.deleted == []
+    assert runtime.sandbox_id == "private-assignment-2"
+    assert logs == ["sandoq: retrying sandbox provisioning after verified cleanup (retry 1/1)"]
+    assert "private provider failure" not in "".join(logs)
+    assert "private cleanup detail" not in "".join(logs)
+    assert "private-assignment" not in "".join(logs)
+
+    await runtime.stop()
+    assert client.deleted == ["private-assignment-2"]
+
+
+async def test_sandoq_runtime_retries_after_runtime_verified_cleanup(monkeypatch) -> None:
+    client = FakeSandoqClient()
+    created: list[str] = []
+
+    async def create(request):
+        client.request = request
+        sandbox_id = f"assignment-{len(created) + 1}"
+        created.append(sandbox_id)
+        return SimpleNamespace(id=sandbox_id)
+
+    async def wait_for_creation(_sandbox_id: str) -> None:
+        if len(created) == 1:
+            raise RuntimeError("readiness failed")
+
+    client.create = create
+    client.wait_for_creation = wait_for_creation
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal"))
+
+    await runtime.start()
+
+    assert created == ["assignment-1", "assignment-2"]
+    assert client.deleted == ["assignment-1"]
+    assert runtime.sandbox_id == "assignment-2"
+    await runtime.stop()
+
+
+async def test_sandoq_runtime_does_not_retry_unverified_attached_cleanup(monkeypatch) -> None:
+    client = FakeSandoqClient()
+    created: list[str] = []
+
+    async def create(request):
+        client.request = request
+        sandbox_id = "private-assignment"
+        created.append(sandbox_id)
+        return SimpleNamespace(id=sandbox_id)
+
+    async def wait_for_creation(sandbox_id: str) -> None:
+        error = RuntimeError("private provider failure")
+        error.cleanup_result = {
+            "status": "poisoned",
+            "assignment_id": sandbox_id,
+            "poisoned": True,
+            "outer_deletion_verified_http_status": None,
+            "error": "private cleanup detail",
+        }
+        raise error
+
+    client.create = create
+    client.wait_for_creation = wait_for_creation
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal", provisioning_retries=3))
+
+    with pytest.raises(SandboxError, match="deletion was not verified") as caught:
+        await runtime.start()
+
+    assert created == ["private-assignment"]
+    assert client.deleted == []
+    assert runtime.descriptor is None
+    assert runtime._active is False
+    assert client.closed is True
+    assert "private provider failure" not in str(caught.value)
+    assert "private cleanup detail" not in str(caught.value)
+    assert "private-assignment" not in str(caught.value)
+
+
+async def test_sandoq_runtime_does_not_retry_create_failure_before_assignment(monkeypatch) -> None:
+    client = FakeSandoqClient()
+    create_calls = 0
+
+    async def create(_request):
+        nonlocal create_calls
+        create_calls += 1
+        raise RuntimeError("private create failure")
+
+    client.create = create
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal", provisioning_retries=3))
+
+    with pytest.raises(SandboxError, match="failed after 1 attempt") as caught:
+        await runtime.start()
+
+    assert create_calls == 1
+    assert runtime.descriptor is None
+    assert runtime._active is False
+    assert client.closed is True
+    assert "private create failure" not in str(caught.value)
+
+
+async def test_sandoq_runtime_provisioning_cancellation_is_not_retried(monkeypatch) -> None:
+    client = FakeSandoqClient()
+    create_calls = 0
+    waiting = asyncio.Event()
+
+    async def create(_request):
+        nonlocal create_calls
+        create_calls += 1
+        return SimpleNamespace(id="private-assignment")
+
+    async def wait_for_creation(sandbox_id: str) -> None:
+        waiting.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as error:
+            error.cleanup_result = {
+                "status": "poisoned",
+                "assignment_id": sandbox_id,
+                "poisoned": True,
+                "outer_deletion_verified_http_status": 404,
+                "error": "private cleanup detail",
+            }
+            raise
+
+    client.create = create
+    client.wait_for_creation = wait_for_creation
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal", provisioning_retries=3))
+    starting = asyncio.create_task(runtime.start())
+    await waiting.wait()
+
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+
+    assert create_calls == 1
+    assert client.deleted == []
+    assert runtime.descriptor is None
+    assert runtime._active is False
+    assert client.closed is True
+
+
+async def test_sandoq_runtime_preserves_provider_wrapped_provisioning_cancellation(
+    monkeypatch,
+) -> None:
+    client = FakeSandoqClient()
+    create_calls = 0
+    waiting = asyncio.Event()
+
+    async def create(_request):
+        nonlocal create_calls
+        create_calls += 1
+        return SimpleNamespace(id="private-assignment")
+
+    async def wait_for_creation(_sandbox_id: str) -> None:
+        waiting.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancellation:
+            raise RuntimeError("private cleanup failure") from cancellation
+
+    client.create = create
+    client.wait_for_creation = wait_for_creation
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal", provisioning_retries=3))
+    starting = asyncio.create_task(runtime.start())
+    await waiting.wait()
+
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+
+    assert create_calls == 1
+    assert client.deleted == ["private-assignment"]
+    assert runtime.descriptor is None
+    assert runtime._active is False
+    assert client.closed is True
+
+
+async def test_sandoq_runtime_reports_aggregate_after_all_provisioning_attempts_fail(
+    monkeypatch,
+) -> None:
+    client = FakeSandoqClient()
+    created: list[str] = []
+    logs: list[str] = []
+
+    async def create(_request):
+        sandbox_id = f"private-assignment-{len(created) + 1}"
+        created.append(sandbox_id)
+        return SimpleNamespace(id=sandbox_id)
+
+    async def wait_for_creation(sandbox_id: str) -> None:
+        error = RuntimeError("private provider failure")
+        error.cleanup_result = {
+            "status": "poisoned",
+            "assignment_id": sandbox_id,
+            "poisoned": True,
+            "outer_deletion_verified_http_status": 404,
+            "error": "private cleanup detail",
+        }
+        raise error
+
+    client.create = create
+    client.wait_for_creation = wait_for_creation
+    monkeypatch.setattr(sandoq, "create_client", lambda config: client)
+    monkeypatch.setattr(sandoq.logger, "warning", lambda message, *args: logs.append(message % args))
+    runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal", provisioning_retries=1))
+
+    with pytest.raises(SandboxError, match="failed after 2 attempts") as caught:
+        await runtime.start()
+
+    assert created == ["private-assignment-1", "private-assignment-2"]
+    assert client.deleted == []
+    assert runtime.descriptor is None
+    assert runtime._active is False
+    assert client.closed is True
+    combined = "".join(logs) + str(caught.value) + "".join(traceback.format_exception(caught.value))
+    assert "private provider failure" not in combined
+    assert "private cleanup detail" not in combined
+    assert "private-assignment" not in combined
 
 
 async def test_sandoq_runtime_builds_prime_sandboxes_042_container_request(
