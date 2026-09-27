@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import stat
 import sys
@@ -30,9 +31,7 @@ class FakeSandoqClient:
     def __init__(self) -> None:
         self.request = None
         self.commands: list[tuple[str, str | None, dict[str, str], int]] = []
-        self.background_commands: list[
-            tuple[str, str | None, dict[str, str], int, int]
-        ] = []
+        self.background_commands: list[tuple[str, str | None, dict[str, str], int, int]] = []
         self.files: dict[str, bytes] = {}
         self.deleted: list[str] = []
         self.closed = False
@@ -74,9 +73,7 @@ class FakeSandoqClient:
         poll_interval: int = 3,
     ):
         assert sandbox_id == "assignment-123"
-        self.background_commands.append(
-            (command, working_dir, env or {}, timeout or 0, poll_interval)
-        )
+        self.background_commands.append((command, working_dir, env or {}, timeout or 0, poll_interval))
         if self.error is not None:
             raise self.error
         return SimpleNamespace(exit_code=0, stdout="program-ok", stderr="")
@@ -230,9 +227,7 @@ def test_sandoq_no_network_accepts_exact_precreate_config(monkeypatch) -> None:
     )
 
 
-def test_sandoq_public_host_harness_accepts_official_provider(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_sandoq_public_host_harness_accepts_official_provider(monkeypatch, tmp_path: Path) -> None:
     client = object()
     ecr_token_file = tmp_path / "ecr-token"
     ecr_token_file.write_text("opaque-token\n")
@@ -330,9 +325,7 @@ async def test_sandoq_runtime_lifecycle(monkeypatch) -> None:
     assert getattr(client.request, "vm", False) is False
     assert client.request.environment_vars == {"OCI_EXPECTED_WORKDIR": "/testbed"}
 
-    result = await runtime.run(
-        ["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"}
-    )
+    result = await runtime.run(["sh", "-c", "printf ok"], {"MESSAGE": "value with spaces"})
     assert result.exit_code == 0
     assert result.stdout == "ok"
     assert client.commands == [
@@ -380,9 +373,7 @@ async def test_sandoq_runtime_retries_after_attached_verified_cleanup(
     client.create = create
     client.wait_for_creation = wait_for_creation
     monkeypatch.setattr(sandoq, "create_client", lambda config: client)
-    monkeypatch.setattr(
-        sandoq.logger, "warning", lambda message, *args: logs.append(message % args)
-    )
+    monkeypatch.setattr(sandoq.logger, "warning", lambda message, *args: logs.append(message % args))
     runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal"))
 
     await runtime.start()
@@ -390,9 +381,7 @@ async def test_sandoq_runtime_retries_after_attached_verified_cleanup(
     assert created == ["private-assignment-1", "private-assignment-2"]
     assert client.deleted == []
     assert runtime.sandbox_id == "private-assignment-2"
-    assert logs == [
-        "sandoq: retrying sandbox provisioning after verified cleanup (retry 1/1)"
-    ]
+    assert logs == ["sandoq: retrying sandbox provisioning after verified cleanup (retry 1/1)"]
     assert "private provider failure" not in "".join(logs)
     assert "private cleanup detail" not in "".join(logs)
     assert "private-assignment" not in "".join(logs)
@@ -606,9 +595,7 @@ async def test_sandoq_runtime_reports_aggregate_after_all_provisioning_attempts_
     client.create = create
     client.wait_for_creation = wait_for_creation
     monkeypatch.setattr(sandoq, "create_client", lambda config: client)
-    monkeypatch.setattr(
-        sandoq.logger, "warning", lambda message, *args: logs.append(message % args)
-    )
+    monkeypatch.setattr(sandoq.logger, "warning", lambda message, *args: logs.append(message % args))
     runtime = SandoqRuntime(SandoqConfig(host_tunnel="modal", provisioning_retries=1))
 
     with pytest.raises(SandboxError, match="failed after 2 attempts") as caught:
@@ -619,11 +606,7 @@ async def test_sandoq_runtime_reports_aggregate_after_all_provisioning_attempts_
     assert runtime.descriptor is None
     assert runtime._active is False
     assert client.closed is True
-    combined = (
-        "".join(logs)
-        + str(caught.value)
-        + "".join(traceback.format_exception(caught.value))
-    )
+    combined = "".join(logs) + str(caught.value) + "".join(traceback.format_exception(caught.value))
     assert "private provider failure" not in combined
     assert "private cleanup detail" not in combined
     assert "private-assignment" not in combined
@@ -660,9 +643,7 @@ def test_sandoq_provisioning_retry_limit_supports_bounded_eight_attempts() -> No
 async def test_sandoq_environment_mode_creates_configured_workdir(monkeypatch) -> None:
     client = FakeSandoqClient()
     monkeypatch.setattr(sandoq, "create_client", lambda config: client)
-    runtime = SandoqRuntime(
-        SandoqConfig(mode="environment", workdir="/workspace", host_tunnel="modal")
-    )
+    runtime = SandoqRuntime(SandoqConfig(mode="environment", workdir="/workspace", host_tunnel="modal"))
 
     await runtime.start()
 
@@ -802,9 +783,7 @@ async def test_sandoq_runtime_rejects_semantically_unverified_delete(
         {"nested_recycle_verified": True, "error": "cleanup incomplete"},
     ],
 )
-async def test_sandoq_runtime_rejects_ambiguous_cleanup_receipts(
-    monkeypatch, response
-) -> None:
+async def test_sandoq_runtime_rejects_ambiguous_cleanup_receipts(monkeypatch, response) -> None:
     client = FakeSandoqClient()
 
     async def ambiguous_delete(_sandbox_id: str):
@@ -976,9 +955,7 @@ async def test_sandoq_runtime_uses_native_reverse_tunnel(monkeypatch) -> None:
         port_urls={"tunnel": "https://tunnel.example/session"},
         metadata={"task_network": "host"},
     )
-    registry = SimpleNamespace(
-        get=lambda sandbox_id: info if sandbox_id == "assignment-123" else None
-    )
+    registry = SimpleNamespace(get=lambda sandbox_id: info if sandbox_id == "assignment-123" else None)
     provider = ModuleType("sandoq_provider")
     provider.registry = registry
     tunnel_module = ModuleType("sandoq_provider.tunnel")
@@ -1017,12 +994,14 @@ async def test_sandoq_runtime_uses_native_reverse_tunnel(monkeypatch) -> None:
 
 async def test_sandoq_runtime_buffers_interception_before_native_tunnel(
     monkeypatch,
+    tmp_path: Path,
 ) -> None:
     events: list[object] = []
     logs: list[str] = []
-    monkeypatch.setattr(
-        sandoq.logger, "info", lambda message, *args: logs.append(message % args)
-    )
+    stats_directory = tmp_path / "stats"
+    stats_directory.mkdir(mode=0o700)
+    monkeypatch.setenv("SANDOQ_BUFFERED_STATS_DIR", str(stats_directory))
+    monkeypatch.setattr(sandoq.logger, "info", lambda message, *args: logs.append(message % args))
 
     class FakeBufferedProxy:
         def __init__(self, endpoint: str, secret: str) -> None:
@@ -1032,6 +1011,19 @@ async def test_sandoq_runtime_buffers_interception_before_native_tunnel(
                 snapshot=lambda: {
                     "requests": 2,
                     "upstream_attempts": 1,
+                    "logical_requests": 1,
+                    "logical_upstream_attempts": 1,
+                    "anonymous_upstream_attempts": 0,
+                    "coalesced_requests": 0,
+                    "replayed_requests": 1,
+                    "expired_logical_retries": 0,
+                    "downstream_disconnects": 0,
+                    "conflicting_requests": 0,
+                    "inflight": 0,
+                    "streamed_requests": 2,
+                    "response_bytes": 100,
+                    "statuses": {"200": 1},
+                    "protocols": {"chat_completions": 2},
                     "paths": {
                         "/v1/chat/completions": 2,
                         "/private/task-derived-path": 1,
@@ -1080,6 +1072,111 @@ async def test_sandoq_runtime_buffers_interception_before_native_tunnel(
     assert 'unknown_path_requests":1' in log
     assert "private failure detail" not in log
     assert "private/task-derived-path" not in log
+    records = list(stats_directory.iterdir())
+    assert len(records) == 1
+    assert stat.S_IMODE(records[0].stat().st_mode) == 0o600
+    persisted = json.loads(records[0].read_bytes())
+    assert persisted == {
+        "schema_version": 1,
+        "kind": "sandoq-buffered-model-proxy-summary",
+        "counters": {
+            "requests": 2,
+            "upstream_attempts": 1,
+            "logical_requests": 1,
+            "logical_upstream_attempts": 1,
+            "anonymous_upstream_attempts": 0,
+            "coalesced_requests": 0,
+            "replayed_requests": 1,
+            "expired_logical_retries": 0,
+            "downstream_disconnects": 0,
+            "conflicting_requests": 0,
+            "inflight": 0,
+            "streamed_requests": 2,
+            "response_bytes": 100,
+            "statuses": {"200": 1},
+            "protocols": {"chat_completions": 2},
+            "error_count": 1,
+            "path_counts": {
+                "/muse-code/models": 0,
+                "/v1/chat/completions": 2,
+                "/v1/responses": 0,
+            },
+            "unknown_path_requests": 1,
+        },
+    }
+
+
+def _valid_buffered_proxy_summary() -> dict[str, object]:
+    return {
+        "requests": 1,
+        "upstream_attempts": 1,
+        "logical_requests": 1,
+        "logical_upstream_attempts": 1,
+        "anonymous_upstream_attempts": 0,
+        "coalesced_requests": 0,
+        "replayed_requests": 0,
+        "expired_logical_retries": 0,
+        "downstream_disconnects": 0,
+        "conflicting_requests": 0,
+        "inflight": 0,
+        "streamed_requests": 1,
+        "response_bytes": 100,
+        "error_count": 0,
+        "unknown_path_requests": 0,
+        "statuses": {"200": 1},
+        "protocols": {"chat_completions": 1},
+        "path_counts": {
+            "/muse-code/models": 0,
+            "/v1/chat/completions": 1,
+            "/v1/responses": 0,
+        },
+    }
+
+
+def test_buffered_proxy_stats_sink_rejects_unsafe_directory(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    stats_directory = tmp_path / "stats"
+    stats_directory.mkdir(mode=0o755)
+    monkeypatch.setenv("SANDOQ_BUFFERED_STATS_DIR", str(stats_directory))
+    with pytest.raises(SandboxError, match="stats publication failed"):
+        sandoq._persist_buffered_proxy_summary(_valid_buffered_proxy_summary())
+    assert list(stats_directory.iterdir()) == []
+
+
+def test_buffered_proxy_stats_sink_rejects_symlink_and_non_directory(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    symlink = tmp_path / "symlink"
+    symlink.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("SANDOQ_BUFFERED_STATS_DIR", str(symlink))
+    with pytest.raises(SandboxError, match="stats publication failed"):
+        sandoq._persist_buffered_proxy_summary(_valid_buffered_proxy_summary())
+    assert list(target.iterdir()) == []
+
+    regular_file = tmp_path / "regular"
+    regular_file.touch(mode=0o600)
+    monkeypatch.setenv("SANDOQ_BUFFERED_STATS_DIR", str(regular_file))
+    with pytest.raises(SandboxError, match="stats publication failed"):
+        sandoq._persist_buffered_proxy_summary(_valid_buffered_proxy_summary())
+
+
+def test_buffered_proxy_stats_sink_rejects_nonaggregate_counter(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    stats_directory = tmp_path / "stats"
+    stats_directory.mkdir(mode=0o700)
+    summary = _valid_buffered_proxy_summary()
+    summary["raw_error"] = "private detail"
+    monkeypatch.setenv("SANDOQ_BUFFERED_STATS_DIR", str(stats_directory))
+    with pytest.raises(SandboxError, match="stats publication failed"):
+        sandoq._persist_buffered_proxy_summary(summary)
+    assert list(stats_directory.iterdir()) == []
 
 
 @pytest.mark.parametrize("updates", [{"host_tunnel": "modal"}, {"mode": "environment"}])
@@ -1275,9 +1372,7 @@ async def test_sandoq_runtime_runs_long_program_as_one_background_job(
     runtime = SandoqRuntime(SandoqConfig(workdir="/testbed", session_timeout=7200))
     await runtime.start()
 
-    result = await runtime.run_program(
-        ["agent", "--task", "value with spaces"], {"MODEL": "kimi"}
-    )
+    result = await runtime.run_program(["agent", "--task", "value with spaces"], {"MODEL": "kimi"})
 
     assert result == ProgramResult(exit_code=0, stdout="program-ok", stderr="")
     assert client.background_commands == [
@@ -1341,9 +1436,7 @@ async def test_sandoq_runtime_surfaces_unknown_gateway_result(monkeypatch) -> No
     client.commands.clear()
 
     async def unknown_result(*args, **kwargs):
-        client.commands.append(
-            (args[1], kwargs.get("working_dir"), kwargs.get("env", {}), 10)
-        )
+        client.commands.append((args[1], kwargs.get("working_dir"), kwargs.get("env", {}), 10))
         return SimpleNamespace(
             exit_code=75,
             stdout="",

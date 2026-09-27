@@ -5,6 +5,8 @@ import contextlib
 import json
 import logging
 import os
+import re
+import secrets
 import shlex
 import stat
 import sys
@@ -35,6 +37,171 @@ _ISOLATED_OCI_ENVIRONMENT = "oci-runner-firecracker"
 _PRODUCTION_ECR_REGISTRY = "168653207203.dkr.ecr.us-east-2.amazonaws.com"
 _PRODUCTION_ECR_REGION = "us-east-2"
 _PRODUCTION_ECR_PULL_THROUGH_PREFIX = "pt_dockerio"
+_BUFFERED_STATS_DIR_ENV = "SANDOQ_BUFFERED_STATS_DIR"
+_BUFFERED_STATS_KIND = "sandoq-buffered-model-proxy-summary"
+_BUFFERED_STATS_MAX_BYTES = 64 * 1024
+_BUFFERED_STATS_INTEGER_FIELDS = frozenset(
+    {
+        "requests",
+        "upstream_attempts",
+        "logical_requests",
+        "logical_upstream_attempts",
+        "anonymous_upstream_attempts",
+        "coalesced_requests",
+        "replayed_requests",
+        "expired_logical_retries",
+        "downstream_disconnects",
+        "conflicting_requests",
+        "inflight",
+        "streamed_requests",
+        "response_bytes",
+        "error_count",
+        "unknown_path_requests",
+    }
+)
+_BUFFERED_STATS_MAPPING_FIELDS = frozenset({"statuses", "protocols", "path_counts"})
+_BUFFERED_STATS_PATHS = frozenset({"/muse-code/models", "/v1/chat/completions", "/v1/responses"})
+
+
+def _nonnegative_counter(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _counter_mapping(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and all(isinstance(key, str) and key for key in value)
+        and all(_nonnegative_counter(count) for count in value.values())
+    )
+
+
+def _validate_buffered_proxy_summary(snapshot: dict[str, Any]) -> None:
+    if (
+        set(snapshot) != _BUFFERED_STATS_INTEGER_FIELDS | _BUFFERED_STATS_MAPPING_FIELDS
+        or any(not _nonnegative_counter(snapshot.get(field)) for field in _BUFFERED_STATS_INTEGER_FIELDS)
+        or any(not _counter_mapping(snapshot.get(field)) for field in _BUFFERED_STATS_MAPPING_FIELDS)
+        or set(snapshot["path_counts"]) != _BUFFERED_STATS_PATHS
+        or not set(snapshot["protocols"]).issubset({"chat_completions", "responses"})
+        or any(re.fullmatch(r"[1-5][0-9]{2}", status) is None for status in snapshot["statuses"])
+        or snapshot["inflight"] != 0
+    ):
+        raise ValueError("buffered proxy summary counters are invalid")
+
+
+def _persist_buffered_proxy_summary(snapshot: dict[str, Any]) -> Path | None:
+    raw_directory = os.environ.get(_BUFFERED_STATS_DIR_ENV)
+    if raw_directory is None:
+        return None
+    directory = Path(raw_directory)
+    try:
+        _validate_buffered_proxy_summary(snapshot)
+        if (
+            not raw_directory
+            or not directory.is_absolute()
+            or directory != Path(os.path.normpath(raw_directory))
+            or directory.resolve(strict=True) != directory
+            or directory.is_symlink()
+        ):
+            raise OSError("buffered stats directory is not canonical")
+        metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise OSError("buffered stats directory is not private")
+        payload = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": _BUFFERED_STATS_KIND,
+                    "counters": snapshot,
+                },
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        if len(payload) > _BUFFERED_STATS_MAX_BYTES:
+            raise OSError("buffered stats record is too large")
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(directory, directory_flags)
+        token = secrets.token_hex(16)
+        temporary_name = f".summary-{token}.tmp"
+        final_name = f"summary-{token}.json"
+        temporary_created = False
+        final_created = False
+        try:
+            held = os.fstat(directory_fd)
+            if (held.st_dev, held.st_ino, held.st_mode, held.st_uid) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+            ):
+                raise OSError("buffered stats directory changed")
+            try:
+                os.stat(final_name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise OSError("buffered stats destination exists")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+            temporary_created = True
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written < 1:
+                        raise OSError("buffered stats write made no progress")
+                    view = view[written:]
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(
+                temporary_name,
+                final_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            temporary_created = False
+            final_created = True
+            os.fsync(directory_fd)
+            published = os.stat(final_name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(published.st_mode)
+                or stat.S_IMODE(published.st_mode) != 0o600
+                or published.st_uid != os.geteuid()
+                or published.st_nlink != 1
+                or published.st_size != len(payload)
+            ):
+                raise OSError("buffered stats publication invalid")
+            held_after = os.fstat(directory_fd)
+            if (held_after.st_dev, held_after.st_ino, held_after.st_mode, held_after.st_uid) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+            ):
+                raise OSError("buffered stats directory changed")
+        except BaseException:
+            if temporary_created:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+            if final_created:
+                with contextlib.suppress(OSError):
+                    os.unlink(final_name, dir_fd=directory_fd)
+            raise
+        finally:
+            os.close(directory_fd)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise SandboxError("buffered Sandoq stats publication failed") from error
+    return directory / final_name
 
 
 def _host_harness_environment(config: "SandoqConfig") -> str | None:
@@ -666,6 +833,7 @@ class SandoqRuntime(Runtime):
                 snapshot["unknown_path_requests"] = sum(
                     int(count) for path, count in paths.items() if path not in snapshot["path_counts"]
                 )
+                _persist_buffered_proxy_summary(snapshot)
                 logger.info(
                     "sandoq: buffered model proxy summary %s",
                     json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
