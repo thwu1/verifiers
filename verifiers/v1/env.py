@@ -185,6 +185,23 @@ class EnvServerConfig(EnvConfig):
 
 logger = logging.getLogger(__name__)
 
+_EXTENDED_SANDOQ_ENVIRONMENTS = frozenset(
+    {"oci-runner-firecracker", "oci-runner-firecracker-small"}
+)
+
+
+def _sandoq_supports_extended_harness_timeout(
+    runtime: RuntimeConfig,
+    harness_timeout: float,
+) -> bool:
+    return (
+        isinstance(runtime, SandoqConfig)
+        and runtime.mode == "oci-runner"
+        and runtime.host_tunnel == "sandoq"
+        and runtime.expected_environment in _EXTENDED_SANDOQ_ENVIRONMENTS
+        and runtime.session_timeout >= harness_timeout
+    )
+
 
 def resolve_runtime_config(
     base: RuntimeConfig, task: Task, warned: set[tuple[str, str]] | None = None
@@ -339,6 +356,10 @@ class Environment:
             harness_timeout is not None
             and harness_timeout > 24 * 60 * 60
             and not runtime_is_local(runtime_config)
+            and not _sandoq_supports_extended_harness_timeout(
+                runtime_config,
+                harness_timeout,
+            )
         ):
             logger.warning(
                 "task %r resolves to a %.1f-hour harness timeout, but %s sandboxes have a "
