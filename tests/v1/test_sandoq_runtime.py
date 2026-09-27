@@ -651,6 +651,12 @@ async def test_sandoq_runtime_builds_prime_sandboxes_042_container_request(
     await runtime.stop()
 
 
+def test_sandoq_provisioning_retry_limit_supports_bounded_eight_attempts() -> None:
+    assert SandoqConfig(provisioning_retries=8).provisioning_retries == 8
+    with pytest.raises(ValueError):
+        SandoqConfig(provisioning_retries=9)
+
+
 async def test_sandoq_environment_mode_creates_configured_workdir(monkeypatch) -> None:
     client = FakeSandoqClient()
     monkeypatch.setattr(sandoq, "create_client", lambda config: client)

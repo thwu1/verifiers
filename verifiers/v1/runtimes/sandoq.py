@@ -88,7 +88,7 @@ class SandoqConfig(BaseConfig):
     disk: float = 5.0
     creates_per_sec: float | None = None
     """Optional process-wide creation pacing; the OCI runner also applies its own pool limits."""
-    provisioning_retries: int = Field(1, ge=0, le=3)
+    provisioning_retries: int = Field(1, ge=0, le=8)
     """Retries after a failed sandbox assignment has been conclusively cleaned up."""
     host_tunnel: Literal["none", "sandoq", "modal", "prime"] = "modal"
     """How a sandbox reaches host interception services."""
