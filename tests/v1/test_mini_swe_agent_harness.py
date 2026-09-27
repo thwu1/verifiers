@@ -13,33 +13,56 @@ from litellm.types.utils import Delta, ModelResponse, StreamingChoices
 from verifiers.v1.harnesses.mini_swe_agent.harness import PROGRAM_SOURCE
 
 
+def test_program_pins_litellm_reasoning_capture_dependency() -> None:
+    assert (
+        '# dependencies = ["mini-swe-agent=={version}", "litellm[proxy]==1.91.2"]'
+        in PROGRAM_SOURCE
+    )
+
+
 def _bash_subprocess_shim():
     tree = ast.parse(PROGRAM_SOURCE)
-    shim = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_BashSubprocess")
+    shim = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "_BashSubprocess"
+    )
     namespace = {"subprocess": subprocess}
-    exec(compile(ast.Module(body=[shim], type_ignores=[]), "program.py", "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[shim], type_ignores=[]), "program.py", "exec"),
+        namespace,
+    )
     return namespace["_BashSubprocess"]
 
 
 def _streaming_query_shim(original_query, stream_chunk_builder):
     tree = ast.parse(PROGRAM_SOURCE)
     query = next(
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_streaming_litellm_query"
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_streaming_litellm_query"
     )
     namespace = {
         "_LOGICAL_REQUEST_HEADER": "X-VF-Logical-Request-ID",
-        "_LOGICAL_REQUEST_ID": contextvars.ContextVar("test_logical_request_id", default="a" * 32),
+        "_LOGICAL_REQUEST_ID": contextvars.ContextVar(
+            "test_logical_request_id", default="a" * 32
+        ),
         "_ORIGINAL_LITELLM_QUERY": original_query,
         "litellm": SimpleNamespace(stream_chunk_builder=stream_chunk_builder),
     }
-    exec(compile(ast.Module(body=[query], type_ignores=[]), "program.py", "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[query], type_ignores=[]), "program.py", "exec"),
+        namespace,
+    )
     return namespace["_streaming_litellm_query"]
 
 
 def _logical_query_shim(original_query):
     tree = ast.parse(PROGRAM_SOURCE)
     query = next(
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_logical_litellm_query"
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_logical_litellm_query"
     )
     request_id = contextvars.ContextVar("test_logical_request_id", default=None)
     namespace = {
@@ -47,7 +70,10 @@ def _logical_query_shim(original_query):
         "_ORIGINAL_LITELLM_PUBLIC_QUERY": original_query,
         "secrets": secrets,
     }
-    exec(compile(ast.Module(body=[query], type_ignores=[]), "program.py", "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[query], type_ignores=[]), "program.py", "exec"),
+        namespace,
+    )
     return namespace["_logical_litellm_query"], request_id
 
 
@@ -97,7 +123,10 @@ def test_mini_swe_agent_logical_request_id_is_stable_within_query_and_rotates() 
     assert seen[0] == seen[1]
     assert seen[2] == seen[3]
     assert seen[0] != seen[2]
-    assert all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) for value in seen)
+    assert all(
+        isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value)
+        for value in seen
+    )
     assert request_id.get() is None
 
 
@@ -133,13 +162,18 @@ def test_mini_swe_agent_model_retry_reuses_logical_request_id() -> None:
     functions = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"_logical_litellm_query", "_streaming_litellm_query"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_logical_litellm_query", "_streaming_litellm_query"}
     ]
     seen: list[str] = []
     namespace = {
         "_LOGICAL_REQUEST_HEADER": "X-VF-Logical-Request-ID",
-        "_LOGICAL_REQUEST_ID": contextvars.ContextVar("test_retry_request_id", default=None),
-        "litellm": SimpleNamespace(stream_chunk_builder=lambda chunks, *, messages: list(chunks)),
+        "_LOGICAL_REQUEST_ID": contextvars.ContextVar(
+            "test_retry_request_id", default=None
+        ),
+        "litellm": SimpleNamespace(
+            stream_chunk_builder=lambda chunks, *, messages: list(chunks)
+        ),
         "secrets": secrets,
     }
 
@@ -159,7 +193,10 @@ def test_mini_swe_agent_model_retry_reuses_logical_request_id() -> None:
 
     namespace["_ORIGINAL_LITELLM_QUERY"] = transport
     namespace["_ORIGINAL_LITELLM_PUBLIC_QUERY"] = public_query
-    exec(compile(ast.Module(body=functions, type_ignores=[]), "program.py", "exec"), namespace)
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), "program.py", "exec"),
+        namespace,
+    )
 
     assert namespace["_logical_litellm_query"](object(), []) == ["response"]
     assert len(seen) == 2
@@ -183,7 +220,11 @@ def test_litellm_stream_rebuild_preserves_reasoning_and_tool_calls() -> None:
             id="response",
             model="model",
             stream=True,
-            choices=[StreamingChoices(index=0, delta=Delta(role="assistant", reasoning_content="reason "))],
+            choices=[
+                StreamingChoices(
+                    index=0, delta=Delta(role="assistant", reasoning_content="reason ")
+                )
+            ],
         ),
         ModelResponse(
             id="response",
@@ -199,7 +240,10 @@ def test_litellm_stream_rebuild_preserves_reasoning_and_tool_calls() -> None:
                                 "index": 0,
                                 "id": "call_1",
                                 "type": "function",
-                                "function": {"name": "bash", "arguments": '{"command":"echo ok"}'},
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": '{"command":"echo ok"}',
+                                },
                             }
                         ],
                     ),
@@ -210,19 +254,28 @@ def test_litellm_stream_rebuild_preserves_reasoning_and_tool_calls() -> None:
             id="response",
             model="model",
             stream=True,
-            choices=[StreamingChoices(index=0, finish_reason="tool_calls", delta=Delta())],
+            choices=[
+                StreamingChoices(index=0, finish_reason="tool_calls", delta=Delta())
+            ],
         ),
     ]
 
-    response = litellm.stream_chunk_builder(chunks, messages=[{"role": "user", "content": "test"}])
+    response = litellm.stream_chunk_builder(
+        chunks, messages=[{"role": "user", "content": "test"}]
+    )
 
     assert response is not None
     assert response.choices[0].message.reasoning_content == "reason retained"
-    assert response.choices[0].message.tool_calls[0].function.arguments == '{"command":"echo ok"}'
+    assert (
+        response.choices[0].message.tool_calls[0].function.arguments
+        == '{"command":"echo ok"}'
+    )
     assert response.choices[0].finish_reason == "tool_calls"
 
 
-def test_mini_swe_agent_246_local_run_and_native_submit(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mini_swe_agent_246_local_run_and_native_submit(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pytest.importorskip("minisweagent")
     if importlib.metadata.version("mini-swe-agent") != "2.4.6":
         pytest.skip("compatibility contract is specific to mini-swe-agent 2.4.6")
