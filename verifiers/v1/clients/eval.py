@@ -107,6 +107,16 @@ def rename_reasoning(message: object, field: str) -> object:
     return renamed
 
 
+def normalize_assistant_message(message: object, reasoning_field: str | None, strip_content: bool) -> object:
+    """Apply the optional reasoning-field rename and content strip to one outbound message."""
+    if reasoning_field:
+        message = rename_reasoning(message, reasoning_field)
+    if strip_content and isinstance(message, dict) and message.get("role") == "assistant":
+        if isinstance(message.get("content"), str):
+            message = {**message, "content": message["content"].strip()}
+    return message
+
+
 class EvalClient(Client):
     """Relay native JSON to the provider and parse a copy for the trace."""
 
@@ -118,6 +128,7 @@ class EvalClient(Client):
         outbound_body_denylist: list[str] | None = None,
         capture_model_io: bool = False,
         assistant_reasoning_field: str | None = None,
+        strip_assistant_content: bool = False,
         timeout: float | None = None,
         connect_timeout: float = 30.0,
         max_connections: int = 28000,
@@ -131,6 +142,7 @@ class EvalClient(Client):
         self.outbound_body_denylist = frozenset(outbound_body_denylist or ())
         self.capture_model_io = capture_model_io
         self.assistant_reasoning_field = assistant_reasoning_field
+        self.strip_assistant_content = strip_assistant_content
         # Build full URLs ourselves (base_url + dialect.upstream_path) rather than relying on
         # httpx base-url joining, which drops the base path for a leading-slash request path.
         self.http = httpx.AsyncClient(
@@ -186,11 +198,14 @@ class EvalClient(Client):
         """Apply dialect overrides, the assistant reasoning-field rename, then the final
         top-level outbound-field denylist."""
         overridden = dialect.apply_overrides(body, model, sampling_args)
-        if self.assistant_reasoning_field and isinstance(overridden.get("messages"), list):
+        if (self.assistant_reasoning_field or self.strip_assistant_content) and isinstance(
+            overridden.get("messages"), list
+        ):
             overridden = {
                 **overridden,
                 "messages": [
-                    rename_reasoning(message, self.assistant_reasoning_field) for message in overridden["messages"]
+                    normalize_assistant_message(message, self.assistant_reasoning_field, self.strip_assistant_content)
+                    for message in overridden["messages"]
                 ],
             }
         if not self.outbound_body_denylist:

@@ -84,6 +84,10 @@ class EvalClientConfig(BaseClientConfig):
     """Rename `reasoning_content` to this field on outbound assistant messages that lack it.
     vLLM >= 0.20 only renders historical reasoning from `reasoning`, while litellm-based agents
     replay it as `reasoning_content`. None (default) relays messages unchanged."""
+    strip_assistant_content: bool = False
+    """Strip surrounding whitespace from outbound assistant `content` strings. Reasoning parsers
+    leave the newline after `</think>` in `content`; chat templates replay it verbatim, whereas
+    SFT data (and prime-rl renderers) strip message content."""
 
     @field_validator("outbound_body_denylist")
     @classmethod
@@ -161,6 +165,7 @@ def resolve_client(config: BaseClientConfig) -> Client:
         outbound_body_denylist=getattr(config, "outbound_body_denylist", []),
         capture_model_io=getattr(config, "capture_model_io", False),
         assistant_reasoning_field=getattr(config, "assistant_reasoning_field", None),
+        strip_assistant_content=getattr(config, "strip_assistant_content", False),
         timeout=config.timeout,
         connect_timeout=config.connect_timeout,
         max_connections=config.max_connections,
