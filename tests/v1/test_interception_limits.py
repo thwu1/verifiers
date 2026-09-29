@@ -322,6 +322,24 @@ def test_usage_only_branches_keep_path_specific_accounting():
     assert right_sampling.max_tokens == 23
 
 
+def test_rollout_caps_apply_to_longest_branch_not_branch_sum():
+    trace = Trace(task=Task(idx=0, prompt="test"))
+    prompt = [UserMessage(content="test")]
+    first = AssistantMessage(content="first")
+    graph.prepare_turn(trace, prompt).commit(_usage_response(prompt=7, completion=3, content="first"))
+    graph.prepare_turn(trace, [*prompt, first, UserMessage(content="left")]).commit(
+        _usage_response(prompt=12, completion=2, content="left answer")
+    )
+    graph.prepare_turn(trace, [*prompt, first, UserMessage(content="right")]).commit(
+        _usage_response(prompt=13, completion=4, content="right answer")
+    )
+
+    # Branch sums (prompt 25, total 31) exceed these caps; no single branch does.
+    assert RolloutLimits(max_input_tokens=20, max_total_tokens=20).reached(trace) is None
+    assert RolloutLimits(max_input_tokens=13).reached(trace) == "max_input_tokens"
+    assert RolloutLimits(max_total_tokens=17).reached(trace) == "max_total_tokens"
+
+
 @pytest.mark.asyncio
 async def test_post_stream_validation_error_is_preserved_on_session(monkeypatch):
     response = Response(
