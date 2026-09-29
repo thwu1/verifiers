@@ -80,6 +80,10 @@ class EvalClientConfig(BaseClientConfig):
     protocol calls such as token counting are not model turns and remain verbatim."""
     capture_model_io: bool = False
     """Persist the exact outbound request JSON and provider response JSON on sampled nodes."""
+    assistant_reasoning_field: Literal["reasoning"] | None = None
+    """Rename `reasoning_content` to this field on outbound assistant messages that lack it.
+    vLLM >= 0.20 only renders historical reasoning from `reasoning`, while litellm-based agents
+    replay it as `reasoning_content`. None (default) relays messages unchanged."""
 
     @field_validator("outbound_body_denylist")
     @classmethod
@@ -156,6 +160,7 @@ def resolve_client(config: BaseClientConfig) -> Client:
         headers=config.headers or None,
         outbound_body_denylist=getattr(config, "outbound_body_denylist", []),
         capture_model_io=getattr(config, "capture_model_io", False),
+        assistant_reasoning_field=getattr(config, "assistant_reasoning_field", None),
         timeout=config.timeout,
         connect_timeout=config.connect_timeout,
         max_connections=config.max_connections,

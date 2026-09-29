@@ -98,6 +98,15 @@ def validate_requested_token_data(response: Response, outbound_body: dict) -> No
         raise model_error("upstream returned missing, misaligned, or non-finite completion logprobs")
 
 
+def rename_reasoning(message: object, field: str) -> object:
+    """Move an assistant message's `reasoning_content` to `field` unless `field` is already set."""
+    if not isinstance(message, dict) or message.get("role") != "assistant" or "reasoning_content" not in message:
+        return message
+    renamed = {key: value for key, value in message.items() if key != "reasoning_content"}
+    renamed.setdefault(field, message["reasoning_content"])
+    return renamed
+
+
 class EvalClient(Client):
     """Relay native JSON to the provider and parse a copy for the trace."""
 
@@ -108,6 +117,7 @@ class EvalClient(Client):
         headers: dict[str, str] | None = None,
         outbound_body_denylist: list[str] | None = None,
         capture_model_io: bool = False,
+        assistant_reasoning_field: str | None = None,
         timeout: float | None = None,
         connect_timeout: float = 30.0,
         max_connections: int = 28000,
@@ -120,6 +130,7 @@ class EvalClient(Client):
         self.headers = dict(headers or {})
         self.outbound_body_denylist = frozenset(outbound_body_denylist or ())
         self.capture_model_io = capture_model_io
+        self.assistant_reasoning_field = assistant_reasoning_field
         # Build full URLs ourselves (base_url + dialect.upstream_path) rather than relying on
         # httpx base-url joining, which drops the base path for a leading-slash request path.
         self.http = httpx.AsyncClient(
@@ -172,8 +183,16 @@ class EvalClient(Client):
         model: str,
         sampling_args: SamplingConfig,
     ) -> dict:
-        """Apply dialect overrides, then the final top-level outbound-field denylist."""
+        """Apply dialect overrides, the assistant reasoning-field rename, then the final
+        top-level outbound-field denylist."""
         overridden = dialect.apply_overrides(body, model, sampling_args)
+        if self.assistant_reasoning_field and isinstance(overridden.get("messages"), list):
+            overridden = {
+                **overridden,
+                "messages": [
+                    rename_reasoning(message, self.assistant_reasoning_field) for message in overridden["messages"]
+                ],
+            }
         if not self.outbound_body_denylist:
             return overridden
         return {key: value for key, value in overridden.items() if key not in self.outbound_body_denylist}
