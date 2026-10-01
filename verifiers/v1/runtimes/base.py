@@ -39,13 +39,22 @@ _DOWNLOAD_UV = (
     "{ command -v curl >/dev/null 2>&1 && curl -LsSf https://astral.sh/uv/install.sh | sh; } "
     "|| { command -v wget >/dev/null 2>&1 && wget -qO- https://astral.sh/uv/install.sh | sh; }"
 )
+# `curl ... | sh` succeeds even when the download fails (sh runs an empty script), so check for the
+# binary and fall back to the GitHub release tarball (astral.sh and releases.astral.sh share an
+# outage domain).
+_UV_TARBALL = "https://github.com/astral-sh/uv/releases/latest/download/uv-$(uname -m)-unknown-linux-gnu.tar.gz"
+_DOWNLOAD_UV_GITHUB = (
+    'command -v uv >/dev/null 2>&1 || { mkdir -p "$HOME/.local/bin" && '
+    f'{{ curl -LsSf "{_UV_TARBALL}" 2>/dev/null || wget -qO- "{_UV_TARBALL}"; }} '
+    '| tar xz -C "$HOME/.local/bin" --strip-components=1; }'
+)
 _ENSURE_UV = (
     'export PATH="$HOME/.local/bin:$PATH" UV_INSTALL_DIR="$HOME/.local/bin"; '
     # Always install the latest uv into $HOME/.local/bin (ahead of any image uv on PATH) rather
     # than reusing whatever the image ships: base images carry wildly varying uvs (too old for the
     # `uv sync --script` / `uv python find --script` that prepare_uv_script runs, or stale/shadowed
     # on PATH). Installing fresh sidesteps all version probing. Falls back to pip when no downloader.
-    f"{{ {_INSTALL_CURL}; {_DOWNLOAD_UV}; }} "
+    f"{{ {_INSTALL_CURL}; {_DOWNLOAD_UV}; {_DOWNLOAD_UV_GITHUB}; command -v uv >/dev/null 2>&1; }} "
     "|| pip install -q -U uv 2>/dev/null"
 )
 _UV_PREPARE_RETRIES = 2
